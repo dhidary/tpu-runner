@@ -1,0 +1,57 @@
+name: example-tpu-runner
+project: your-gcp-project-id
+controller_region: us-central1
+controller_timeout: 168h
+controller_memory: 1Gi
+controller_max_retries: 3
+ssh_transport: direct
+firestore_location: nam5
+network: default
+subnetwork: default
+# Existing Secret Manager secret names; jobs fetch their values at runtime.
+worker_secrets: []
+
+# count caps TPU VMs; chip_limit caps physical chips per model, family, and zone.
+tpus:
+  # Replace this with an existing 32-chip v4 TPU, or remove this entry.
+  - id: us-central2b-v4-ondemand
+    type: v4-64
+    zone: us-central2-b
+    existing: your-existing-v4-tpu
+    provisioning_model: on-demand
+    chip_limit: 32
+
+  - id: us-central2b-v4-spot
+    type: v4-64
+    zone: us-central2-b
+    runtime: tpu-ubuntu2204-base
+    count: 1
+    chip_limit: 32
+
+  - id: us-east1d-v6e-spot
+    type: v6e-64
+    zone: us-east1-d
+    runtime: v2-alpha-tpuv6e
+    count: 1
+    chip_limit: 64
+
+  - id: europe-west4a-v6e-spot
+    type: v6e-64
+    zone: europe-west4-a
+    runtime: v2-alpha-tpuv6e
+    count: 1
+    chip_limit: 64
+
+  - id: us-central1a-v5e-spot
+    type: v5litepod-64
+    zone: us-central1-a
+    runtime: v2-alpha-tpuv5-lite
+    count: 1
+    chip_limit: 64
+
+  - id: europe-west4b-v5e-spot
+    type: v5litepod-64
+    zone: europe-west4-b
+    runtime: v2-alpha-tpuv5-lite
+    count: 1
+    chip_limit: 64

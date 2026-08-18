@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+/scratch/
+build/
+dist/
+*.egg-info/
+deployment.yaml
+uv.lock
+
+# Local agent configuration
+/.claude/
+/.codex/
+/.github/hooks/

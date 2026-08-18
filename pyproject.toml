@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tpu-runner"
+version = "0.1.0"
+description = "Minimal Google Cloud TPU job runner"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = [
+    "google-cloud-firestore>=2.16",
+    "PyYAML>=6.0",
+]
+keywords = ["gcp", "google-cloud", "tpu", "orchestration"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Distributed Computing",
+]
+
+[project.optional-dependencies]
+release = ["build>=1,<2", "twine>=6,<7"]
+
+[project.scripts]
+tpu-runner = "tpu_runner.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["tpu_runner*"]
+
+[tool.setuptools.package-data]
+tpu_runner = ["*.sh", "*.txt", "*.yaml", "Dockerfile"]

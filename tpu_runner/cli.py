@@ -1,0 +1,1344 @@
+from __future__ import annotations
+
+import argparse
+import base64
+import fnmatch
+import gzip
+import hashlib
+import json
+import os
+import shlex
+import subprocess
+import sys
+import tarfile
+import tempfile
+import threading
+import time
+import uuid
+from collections.abc import Mapping, Sequence
+from dataclasses import asdict, replace
+from datetime import datetime, timezone
+from pathlib import Path
+
+from . import __version__
+from .region_pools import region_is_in_pool
+from .specs import (
+    DEFAULT_RUNNER_BUCKET_LOCATION,
+    JOB_PRIORITY_CLASSES,
+    JobSpec,
+    job_specs_from_dict,
+    load_fleet_spec,
+    load_job_specs,
+    load_yaml_file,
+    region_from_zone,
+    slugify,
+)
+
+PACKAGE_DIR = Path(__file__).resolve().parent
+DEFAULT_DEPLOYMENT_PATH = Path("deployment.yaml")
+DEFAULT_JOB_PATH = Path("job.yaml")
+CONTROLLER_RECONCILE_SECONDS = 30
+CONTROLLER_LEASE_SECONDS = 900
+CONTROLLER_LEASE_RENEW_SECONDS = 60
+TERMINAL_JOB_STATES = {"succeeded", "failed", "deactivated"}
+IGNORED_BUNDLE_NAMES = {
+    ".git",
+    ".venv",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".DS_Store",
+    "__pycache__",
+}
+
+
+class ControllerLeaseRenewer:
+    """Keep a controller lease live while reconciliation blocks on remote I/O."""
+
+    def __init__(
+        self,
+        *,
+        store,
+        name: str,
+        owner: str,
+        epoch: str,
+        ttl_seconds: int,
+        interval_seconds: int,
+    ) -> None:
+        if interval_seconds <= 0 or interval_seconds >= ttl_seconds:
+            raise ValueError("lease renewal interval must be positive and below its TTL")
+        self.store = store
+        self.name = name
+        self.owner = owner
+        self.epoch = epoch
+        self.ttl_seconds = ttl_seconds
+        self.interval_seconds = interval_seconds
+        self._stop = threading.Event()
+        self._lost = threading.Event()
+        self._renew_lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None:
+            raise RuntimeError("controller lease renewer is already started")
+        self._thread = threading.Thread(
+            target=self._run,
+            name="tpu-runner-controller-lease",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_seconds):
+            try:
+                if not self.renew():
+                    return
+            except Exception as exc:
+                # A synchronous controller heartbeat remains authoritative and
+                # will either recover the renewal or stop reconciliation. Keep
+                # retrying here so one transient Firestore error does not let a
+                # healthy lease age all the way to its TTL.
+                print(
+                    f"controller lease background renewal failed; retrying: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+    def renew(self) -> bool:
+        if self._lost.is_set() or self._stop.is_set():
+            return False
+        with self._renew_lock:
+            if self._lost.is_set() or self._stop.is_set():
+                return False
+            acquired = self.store.acquire_lease(
+                self.name,
+                self.owner,
+                self.ttl_seconds,
+                epoch=self.epoch,
+            )
+            if not acquired:
+                self._lost.set()
+            return bool(acquired)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            # Do not release the lease until an in-flight background renewal is
+            # finished; otherwise it could reacquire immediately after release.
+            self._thread.join()
+            self._thread = None
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="tpu-runner",
+        description=(
+            "Orchestrate queued jobs across regional, demand-driven Google "
+            "Cloud Spot TPU capacity."
+        ),
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+    sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+
+    fleet_parser = sub.add_parser(
+        "validate-fleet", help="validate a deployment file without cloud changes"
+    )
+    fleet_parser.add_argument(
+        "path",
+        nargs="?",
+        default=str(DEFAULT_DEPLOYMENT_PATH),
+        help="deployment YAML path (default: deployment.yaml)",
+    )
+
+    jobs_parser = sub.add_parser(
+        "validate-jobs", help="validate a job manifest without submitting it"
+    )
+    jobs_parser.add_argument(
+        "path",
+        nargs="?",
+        default=str(DEFAULT_JOB_PATH),
+        help="job manifest YAML path (default: job.yaml)",
+    )
+
+    init_parser = sub.add_parser(
+        "init", help="write an example deployment file in the current directory"
+    )
+    init_parser.add_argument(
+        "path",
+        nargs="?",
+        default=str(DEFAULT_DEPLOYMENT_PATH),
+        help="output path (default: deployment.yaml)",
+    )
+
+    submit_parser = sub.add_parser("submit", help="submit jobs from a manifest")
+    submit_parser.add_argument(
+        "path",
+        nargs="?",
+        default=str(DEFAULT_JOB_PATH),
+        help="job manifest YAML path (default: job.yaml)",
+    )
+    submit_parser.add_argument(
+        "--job-id",
+        action="append",
+        dest="job_ids",
+        help="submit only this exact manifest job id; may be repeated",
+    )
+
+    watch_parser = sub.add_parser("watch", help="watch one job until it is terminal")
+    watch_parser.add_argument("job_id", help="job ID to watch")
+
+    logs_parser = sub.add_parser("logs", help="show logs for one job")
+    logs_parser.add_argument("job_id", help="job ID whose logs should be shown")
+
+    cancel_parser = sub.add_parser("cancel", help="cancel one or more jobs")
+    cancel_parser.add_argument("job_ids", nargs="+", help="job IDs to cancel")
+    cancel_parser.add_argument(
+        "--if-pending",
+        action="store_true",
+        help=(
+            "deactivate only if the job is still unassigned and pending; "
+            "fail without mutation if assignment has started"
+        ),
+    )
+
+    priority_parser = sub.add_parser(
+        "set-priority",
+        help="atomically reprioritize one pending, unassigned job",
+    )
+    priority_parser.add_argument("job_id", help="pending job ID")
+    priority_parser.add_argument(
+        "priority",
+        choices=JOB_PRIORITY_CLASSES,
+        help="new queue priority",
+    )
+
+    interrupt_parser = sub.add_parser(
+        "interrupt-spot",
+        help="request deletion of one exact runner-managed Spot attempt",
+    )
+    interrupt_parser.add_argument("resource_id", help="managed TPU resource ID")
+    interrupt_parser.add_argument("--job-id", required=True, help="owning job ID")
+    interrupt_parser.add_argument(
+        "--attempt-id", required=True, help="active attempt ID"
+    )
+
+    probe_parser = sub.add_parser(
+        "probe-adopted-device-owners",
+        help="read root-visible TPU device owners on every worker without mutation",
+    )
+    probe_parser.add_argument(
+        "--resource-id", required=True, help="adopted TPU resource ID"
+    )
+
+    status_parser = sub.add_parser("status", help="emit read-only fleet state as JSON")
+    status_parser.add_argument(
+        "--deployment",
+        default=str(DEFAULT_DEPLOYMENT_PATH),
+        help="deployment YAML path (default: deployment.yaml)",
+    )
+    status_parser.add_argument(
+        "--pretty", action="store_true", help="pretty-print the JSON output"
+    )
+
+    sub.add_parser("controller")
+    bootstrap_parser = sub.add_parser("bootstrap-ready")
+    bootstrap_parser.add_argument("--deployment", default=str(DEFAULT_DEPLOYMENT_PATH))
+    bootstrap_parser.add_argument("--startup", required=True)
+
+    deploy_parser = sub.add_parser(
+        "deploy", help="create or update the declared runner deployment"
+    )
+    deploy_parser.add_argument(
+        "path",
+        nargs="?",
+        default=str(DEFAULT_DEPLOYMENT_PATH),
+        help="deployment YAML path (default: deployment.yaml)",
+    )
+
+    lease_parser = sub.add_parser("release-controller-lease")
+    lease_parser.add_argument("--deployment", required=True)
+    lease_parser.add_argument("--owner", required=True)
+
+    wait_lease_parser = sub.add_parser("wait-controller-release")
+    wait_lease_parser.add_argument("--deployment", required=True)
+    wait_lease_parser.add_argument("--timeout-seconds", type=int, default=1200)
+    wait_lease_parser.add_argument("--poll-seconds", type=float, default=5.0)
+
+    epoch_parser = sub.add_parser("set-controller-epoch")
+    epoch_parser.add_argument("--deployment", required=True)
+    epoch_parser.add_argument("--epoch", required=True)
+
+    args = parser.parse_args(argv)
+    if args.command == "validate-fleet":
+        spec = load_fleet_spec(materialize_path(args.path))
+        print(json.dumps({"bucket": spec.bucket, "tpus": [entry.__dict__ for entry in spec.tpus]}, indent=2))
+        return 0
+    if args.command == "validate-jobs":
+        specs = load_job_specs(materialize_path(args.path))
+        jobs = []
+        for job in specs:
+            item = asdict(job)
+            for internal in (
+                "bucket_regions",
+                "regional_bundles",
+                "region",
+                "storage_region",
+                "bucket",
+            ):
+                item.pop(internal)
+            jobs.append(item)
+        print(json.dumps({"jobs": jobs}, indent=2, default=list))
+        return 0
+    if args.command == "init":
+        output = Path(args.path)
+        if output.exists():
+            raise ValueError(f"refusing to overwrite existing deployment file: {output}")
+        output.write_text(
+            (PACKAGE_DIR / "deployment.example.yaml").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        print(f"wrote {output}")
+        return 0
+    if args.command == "submit":
+        return submit_jobs(Path(args.path), job_ids=args.job_ids)
+    if args.command == "watch":
+        return watch_job(args.job_id)
+    if args.command == "logs":
+        return show_logs(args.job_id)
+    if args.command == "cancel":
+        return cancel_jobs(args.job_ids, if_pending=args.if_pending)
+    if args.command == "set-priority":
+        return set_job_priority(
+            args.job_id,
+            priority=args.priority,
+        )
+    if args.command == "interrupt-spot":
+        return request_controlled_interruption(
+            resource_id=args.resource_id,
+            job_id=args.job_id,
+            attempt_id=args.attempt_id,
+        )
+    if args.command == "probe-adopted-device-owners":
+        return probe_adopted_device_owners(args.resource_id)
+    if args.command == "status":
+        payload = fleet_status(Path(args.deployment))
+        print(json.dumps(payload, indent=2 if args.pretty else None, sort_keys=True))
+        return 0
+    if args.command == "controller":
+        from .controller import Controller
+        from .gcp import SubprocessGCPClient
+        from .runtime import FirestoreStateStore
+
+        require_controller_ssh_identity(os.environ)
+        fleet, _, store = runner_context()
+        owner = os.environ.get("CLOUD_RUN_EXECUTION") or os.environ.get("HOSTNAME") or f"local-{uuid.uuid4()}"
+        epoch = os.environ.get("TPU_RUNNER_CONTROLLER_EPOCH", "")
+        lease_name = "controller"
+        if not store.acquire_lease(
+            lease_name,
+            owner,
+            CONTROLLER_LEASE_SECONDS,
+            epoch=epoch,
+        ):
+            store.record_event("controller_skipped", {"reason": "lease_held", "owner": owner})
+            print(json.dumps({"status": "skipped", "reason": "lease_held"}))
+            return 0
+        lease_renewer = ControllerLeaseRenewer(
+            store=store,
+            name=lease_name,
+            owner=owner,
+            epoch=epoch,
+            ttl_seconds=CONTROLLER_LEASE_SECONDS,
+            interval_seconds=CONTROLLER_LEASE_RENEW_SECONDS,
+        )
+        lease_renewer.start()
+        controller = Controller(
+            fleet=fleet,
+            store=store,
+            gcp=SubprocessGCPClient(fleet=fleet),
+            renew_lease=lease_renewer.renew,
+        )
+        try:
+            while True:
+                if not lease_renewer.renew():
+                    raise RuntimeError("controller lost its leader lease")
+                try:
+                    controller.reconcile_once()
+                except subprocess.SubprocessError as exc:
+                    store.record_event("controller_gcp_error", {"error": str(exc)})
+                    print(f"controller GCP operation failed; retrying: {exc}", file=os.sys.stderr, flush=True)
+                    time.sleep(CONTROLLER_RECONCILE_SECONDS)
+                    continue
+                active_jobs = store.has_jobs_with_statuses(
+                    {"pending", "running", "cancelling"}
+                )
+                if active_jobs or controller.managed_capacity_exists():
+                    time.sleep(CONTROLLER_RECONCILE_SECONDS)
+                    continue
+
+                # Release before the final check so a concurrent submission can
+                # either be observed here or acquire the lease itself.
+                lease_renewer.stop()
+                store.release_lease(lease_name, owner)
+                if not store.has_jobs_with_statuses(
+                    {"pending", "running", "cancelling"}
+                ):
+                    print(json.dumps({"status": "idle"}))
+                    return 0
+                if not store.acquire_lease(
+                    lease_name,
+                    owner,
+                    CONTROLLER_LEASE_SECONDS,
+                    epoch=epoch,
+                ):
+                    print(json.dumps({"status": "handed_off"}))
+                    return 0
+                lease_renewer = ControllerLeaseRenewer(
+                    store=store,
+                    name=lease_name,
+                    owner=owner,
+                    epoch=epoch,
+                    ttl_seconds=CONTROLLER_LEASE_SECONDS,
+                    interval_seconds=CONTROLLER_LEASE_RENEW_SECONDS,
+                )
+                lease_renewer.start()
+                controller.renew_lease = lease_renewer.renew
+        finally:
+            lease_renewer.stop()
+            store.release_lease(lease_name, owner)
+    if args.command == "bootstrap-ready":
+        return bootstrap_ready(Path(args.deployment), Path(args.startup))
+    if args.command == "deploy":
+        deployment_path = Path(args.path).resolve()
+        fleet = load_fleet_spec(deployment_path)
+        env = dict(os.environ)
+        env["TPU_RUNNER_PYTHON"] = sys.executable
+        env["TPU_RUNNER_DEPLOYMENT_PATH"] = str(deployment_path)
+        env["TPU_RUNNER_NAME"] = fleet.name
+        env["TPU_RUNNER_PROJECT"] = fleet.project
+        env["TPU_RUNNER_BUCKET"] = fleet.bucket
+        env["TPU_RUNNER_BUCKET_LOCATION"] = DEFAULT_RUNNER_BUCKET_LOCATION
+        env["TPU_RUNNER_CONTROLLER_REGION"] = fleet.controller_region
+        env["TPU_RUNNER_CONTROLLER_TIMEOUT"] = fleet.controller_timeout
+        env["TPU_RUNNER_CONTROLLER_MEMORY"] = fleet.controller_memory
+        env["TPU_RUNNER_CONTROLLER_MAX_RETRIES"] = str(
+            fleet.controller_max_retries
+        )
+        env["TPU_RUNNER_SSH_TRANSPORT"] = fleet.ssh_transport
+        env["TPU_RUNNER_CONTROLLER_EPOCH"] = uuid.uuid4().hex
+        env["TPU_RUNNER_FIRESTORE_LOCATION"] = fleet.firestore_location
+        env["TPU_RUNNER_NETWORK"] = fleet.network
+        env["TPU_RUNNER_WORKER_SECRETS"] = "\n".join(fleet.worker_secrets)
+        return subprocess.run(["bash", str(PACKAGE_DIR / "deploy.sh")], env=env, check=False).returncode
+    if args.command == "release-controller-lease":
+        from .runtime import FirestoreStateStore
+
+        fleet = load_fleet_spec(materialize_path(args.deployment))
+        store = FirestoreStateStore(
+            collection_prefix=fleet.name.replace("-", "_"),
+            project=fleet.project,
+        )
+        store.release_lease("controller", args.owner)
+        print(json.dumps({"status": "released_if_owned", "owner": args.owner}))
+        return 0
+    if args.command == "wait-controller-release":
+        from .runtime import FirestoreStateStore, lease_is_live
+
+        if args.timeout_seconds <= 0 or args.poll_seconds <= 0:
+            raise ValueError("controller release timeout and poll interval must be positive")
+        fleet = load_fleet_spec(materialize_path(args.deployment))
+        store = FirestoreStateStore(
+            collection_prefix=fleet.name.replace("-", "_"),
+            project=fleet.project,
+        )
+        deadline = time.monotonic() + args.timeout_seconds
+        while True:
+            lease = store.get_lease("controller")
+            if not lease_is_live(lease, now=datetime.now(timezone.utc)):
+                print(json.dumps({"status": "released", "lease": lease}, default=str, sort_keys=True))
+                return 0
+            if time.monotonic() >= deadline:
+                print(
+                    json.dumps({"status": "timeout", "lease": lease}, default=str, sort_keys=True),
+                    file=sys.stderr,
+                )
+                return 1
+            time.sleep(args.poll_seconds)
+    if args.command == "set-controller-epoch":
+        from .runtime import FirestoreStateStore
+
+        fleet = load_fleet_spec(materialize_path(args.deployment))
+        store = FirestoreStateStore(
+            collection_prefix=fleet.name.replace("-", "_"),
+            project=fleet.project,
+        )
+        store.set_lease_epoch("controller", args.epoch)
+        print(json.dumps({"status": "updated", "epoch": args.epoch}))
+        return 0
+    raise AssertionError(args.command)
+
+
+def require_controller_ssh_identity(env: Mapping[str, str]) -> None:
+    """Fail before leasing when a controller cannot act as the runner user."""
+
+    ssh_user = env.get("TPU_RUNNER_SSH_USER", "").strip()
+    ssh_private_key = env.get("TPU_RUNNER_SSH_PRIVATE_KEY", "").strip()
+    if not ssh_user or not ssh_private_key:
+        raise ValueError(
+            "controller requires TPU_RUNNER_SSH_USER and "
+            "TPU_RUNNER_SSH_PRIVATE_KEY; use the deployed controller or inject "
+            "the exact runner identity"
+        )
+
+
+def materialize_path(path: str) -> Path:
+    if not path.startswith("gs://"):
+        return Path(path)
+    tmp = Path(tempfile.mkdtemp(prefix="tpu-runner-spec-")) / Path(path).name
+    subprocess.run(["gcloud", "storage", "cp", path, str(tmp)], check=True)
+    return tmp
+
+
+def bootstrap_ready(deployment_path: Path, startup_path: Path) -> int:
+    from .gcp import SubprocessGCPClient, resource_matches_entry
+
+    fleet = load_fleet_spec(deployment_path)
+    ssh_transport = "direct" if fleet.ssh_transport == "direct" else "iap"
+    payload = base64.b64encode(startup_path.read_bytes()).decode()
+    remote_command = f"printf %s {shlex.quote(payload)} | base64 -d | sudo bash"
+    ready_tpus = sorted(
+        (
+            tpu
+            for tpu in SubprocessGCPClient(fleet=fleet).list_tpus(
+                project=fleet.project
+            )
+            if tpu.ready_for_ssh(ssh_transport)
+            and any(resource_matches_entry(tpu, entry) for entry in fleet.tpus)
+        ),
+        key=lambda tpu: (tpu.zone, tpu.name),
+    )
+    for tpu in ready_tpus:
+        command = [
+            "gcloud", "alpha", "compute", "tpus", "tpu-vm", "ssh",
+            tpu.name,
+            f"--project={fleet.project}",
+            f"--zone={tpu.zone}",
+            "--worker=all",
+            "--quiet",
+            f"--command={remote_command}",
+        ]
+        if ssh_transport == "iap":
+            command.insert(-2, "--tunnel-through-iap")
+        subprocess.run(command, check=True)
+        print(f"bootstrapped ready TPU {tpu.name}")
+    return 0
+
+
+def runner_context():
+    from .runtime import FirestoreStateStore
+
+    deployment_path = os.environ.get("TPU_RUNNER_DEPLOYMENT", str(DEFAULT_DEPLOYMENT_PATH))
+    fleet = load_fleet_spec(materialize_path(deployment_path))
+    prefix = fleet.name.replace("-", "_")
+    return fleet, fleet.project, FirestoreStateStore(project=fleet.project, collection_prefix=prefix)
+
+
+def probe_adopted_device_owners(resource_id: str) -> int:
+    from .distributed import DistributedTPURunner
+
+    fleet, project, store = runner_context()
+    resource = store.get_resource(resource_id)
+    if resource is None:
+        raise ValueError(f"resource not found: {resource_id!r}")
+    if not resource.adopted:
+        raise ValueError(f"resource {resource_id!r} is not adopted")
+    if resource.status != "idle" or resource.current_job_id or resource.current_attempt_id:
+        raise ValueError(f"resource {resource_id!r} is not exactly idle and unassigned")
+    workers = DistributedTPURunner(
+        name=fleet.name,
+        project=project,
+        ssh_transport=fleet.ssh_transport,
+    ).probe_device_owners(resource=resource)
+    clear = len(workers) == max(1, resource.worker_count) and all(
+        bool(worker["clear"]) for worker in workers.values()
+    )
+    payload = {
+        "resource_id": resource.id,
+        "tpu_name": resource.tpu_name,
+        "zone": resource.zone,
+        "clear": clear,
+        "workers": workers,
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    store.record_event("adopted_tpu_device_owner_probe", payload)
+    print(json.dumps(payload, sort_keys=True))
+    return 0 if clear else 75
+
+
+def fleet_status(deployment_path: Path) -> dict:
+    """Read durable runner state without mutating the fleet or queue."""
+    from .runtime import FirestoreStateStore
+
+    fleet = load_fleet_spec(materialize_path(str(deployment_path)))
+    store = FirestoreStateStore(
+        project=fleet.project,
+        collection_prefix=fleet.name.replace("-", "_"),
+    )
+    return build_status_payload(
+        fleet=fleet,
+        jobs=store.list_jobs(),
+        attempts=store.list_attempts(),
+        resources=store.list_resources(),
+        interruption_requests=store.list_interruption_requests(),
+    )
+
+
+def build_status_payload(
+    *,
+    fleet,
+    jobs,
+    attempts,
+    resources,
+    interruption_requests,
+) -> dict:
+    """Build the small JSON contract used by operational verifiers."""
+    generated_at = datetime.now(timezone.utc)
+    from .gcp import generated_resource_names
+
+    attempts_by_job: dict[str, list] = {}
+    from .controller import desired_managed_capacity_counts
+
+    attempts_by_id = {attempt.id: attempt for attempt in attempts}
+    for attempt in attempts:
+        attempts_by_job.setdefault(attempt.job_id, []).append(attempt)
+    resources_by_id = {resource.id: resource for resource in resources}
+    job_items: list[dict] = []
+    for job in sorted(jobs, key=lambda candidate: candidate.spec.id):
+        job_attempts = attempts_by_job.get(job.spec.id, [])
+        current = attempts_by_id.get(job.current_attempt_id or "")
+        resource = resources_by_id.get(current.resource_id) if current else None
+        compute_region = region_from_zone(resource.zone) if resource else ""
+        if not job.spec.storage_region:
+            placement_status = "racing"
+        elif compute_region and (
+            not region_is_in_pool(compute_region, job.spec.region)
+            or compute_region != job.spec.storage_region
+        ):
+            placement_status = "compute_region_mismatch"
+        else:
+            placement_status = "pinned"
+        requested_tpu = list(job.spec.tpu) if isinstance(job.spec.tpu, tuple) else job.spec.tpu
+        job_items.append(
+            {
+                "job_id": job.spec.id,
+                "status": job.status,
+                "submitted_at": job.submitted_at,
+                "priority": job.spec.priority,
+                "tpu": requested_tpu,
+                "tpu_name": resource.tpu_name if resource else job.spec.tpu_name,
+                "zone": resource.zone if resource else job.spec.zone,
+                "buckets": list(job.spec.buckets),
+                "selected_bucket": job.spec.bucket,
+                "candidate_regions": [
+                    region for region, _ in job.spec.bucket_regions
+                ],
+                "region": job.spec.region,
+                "storage_region": job.spec.storage_region,
+                "compute_region": compute_region,
+                "placement_status": placement_status,
+                "resource_id": current.resource_id if current else job.assigned_resource_id,
+                "current_attempt_id": job.current_attempt_id,
+                "current_attempt_status": current.status if current else None,
+                "attempt_count": len(job_attempts),
+                "interruption_count": sum(
+                    attempt.status == "interrupted" for attempt in job_attempts
+                ),
+            }
+        )
+
+    attempt_items = sorted((asdict(attempt) for attempt in attempts), key=lambda item: item["id"])
+    resource_items = sorted((asdict(resource) for resource in resources), key=lambda item: item["id"])
+    interruption_items = sorted(
+        (asdict(request) for request in interruption_requests), key=lambda item: item["id"]
+    )
+    desired_counts = desired_managed_capacity_counts(
+        jobs,
+        fleet=fleet,
+        resources=tuple(resources),
+    )
+    fleet_entries = []
+    for entry in fleet.tpus:
+        declared = (
+            [{"tpu_name": entry.existing, "queued_resource": None}]
+            if entry.adopted
+            else [
+                {"queued_resource": queued_name, "tpu_name": node_id}
+                for queued_name, node_id in (
+                    generated_resource_names(entry, ordinal)
+                    for ordinal in range(1, entry.count + 1)
+                )
+            ]
+        )
+        fleet_entries.append(
+            {
+                "id": entry.id,
+                "type": entry.type,
+                "zone": entry.zone,
+                "provisioning_model": entry.provisioning_model,
+                "adopted": entry.adopted,
+                "ceiling_count": 1 if entry.adopted else entry.count,
+                "desired_count": (
+                    1 if entry.adopted else desired_counts.get(entry.id, 0)
+                ),
+                "keep_warm": entry.keep_warm,
+                "declared": declared,
+            }
+        )
+
+    def counts(items: list[dict]) -> dict[str, int]:
+        result: dict[str, int] = {}
+        for item in items:
+            status = str(item.get("status") or "unknown")
+            result[status] = result.get(status, 0) + 1
+        return dict(sorted(result.items()))
+
+    return {
+        "schema_version": 2,
+        "generated_at": generated_at.isoformat(),
+        "fleet": {
+            "name": fleet.name,
+            "project": fleet.project,
+            "entries": fleet_entries,
+        },
+        "jobs": {"counts": counts(job_items), "items": job_items},
+        "attempts": {"counts": counts(attempt_items), "items": attempt_items},
+        "resources": {"counts": counts(resource_items), "items": resource_items},
+        "interruption_requests": {
+            "counts": counts(interruption_items),
+            "items": interruption_items,
+        },
+    }
+
+
+def select_job_specs(
+    raw_specs: tuple[JobSpec, ...], requested_job_ids: Sequence[str] | None
+) -> tuple[JobSpec, ...]:
+    """Return an exact manifest-ordered selection before any external work."""
+    if requested_job_ids is None:
+        return raw_specs
+    requested = tuple(str(job_id) for job_id in requested_job_ids)
+    if not requested or any(not job_id for job_id in requested):
+        raise ValueError("job selection must contain at least one non-empty job id")
+    duplicates = sorted(
+        job_id for job_id in set(requested) if requested.count(job_id) > 1
+    )
+    if duplicates:
+        raise ValueError(f"duplicate requested job id(s): {', '.join(duplicates)}")
+    known_ids = {spec.id for spec in raw_specs}
+    missing = sorted(set(requested) - known_ids)
+    if missing:
+        raise ValueError(f"requested job id(s) not found in manifest: {', '.join(missing)}")
+    selected_ids = set(requested)
+    selected = tuple(spec for spec in raw_specs if spec.id in selected_ids)
+    if not selected:
+        raise ValueError("job selection is empty")
+    return selected
+
+
+def submit_jobs(path: Path, *, job_ids: Sequence[str] | None = None) -> int:
+    from .gcp import generated_resource_names
+    from .placement import (
+        gcloud_bucket_location,
+        resolve_regional_buckets,
+        validate_job_gcs_dependencies,
+    )
+    from .runtime import GCSArtifactClient, JobRecord, job_record_to_dict
+
+    source_path = materialize_path(str(path))
+    data = load_yaml_file(source_path)
+    jobs_raw = data.get("jobs")
+    if not isinstance(jobs_raw, list) or not jobs_raw:
+        raise ValueError("job spec field 'jobs' must be a non-empty list")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    for index, raw in enumerate(jobs_raw, start=1):
+        if not isinstance(raw, dict):
+            raise ValueError("each job entry must be a mapping")
+        if not raw.get("id"):
+            env = raw.get("env") if isinstance(raw.get("env"), dict) else {}
+            base = slugify(str(env.get("RUN_NAME") or f"job-{index}"))[:40]
+            raw["id"] = f"{base}-{stamp}-{uuid.uuid4().hex[:6]}"
+    raw_specs = select_job_specs(job_specs_from_dict(data), job_ids)
+
+    fleet, project, store = runner_context()
+    known_tpus = {
+        entry.existing: entry
+        for entry in fleet.tpus
+        if entry.existing
+    }
+    for entry in fleet.tpus:
+        if entry.adopted:
+            continue
+        for ordinal in range(1, entry.count + 1):
+            _, tpu_name = generated_resource_names(entry, ordinal)
+            known_tpus[tpu_name] = entry
+    for raw_spec in raw_specs:
+        if store.get_job(raw_spec.id) is not None:
+            raise ValueError(f"job already exists: {raw_spec.id}")
+        if raw_spec.tpu_name:
+            target_entry = known_tpus.get(raw_spec.tpu_name)
+            if target_entry is None:
+                raise ValueError(f"tpu_name is not declared in the fleet: {raw_spec.tpu_name}")
+            if not raw_spec.accepts_tpu_type(target_entry.type):
+                raise ValueError(
+                    f"tpu_name {raw_spec.tpu_name} has type {target_entry.type}, "
+                    f"which is not allowed by tpu={raw_spec.tpu}"
+                )
+            if raw_spec.zone and raw_spec.zone != target_entry.zone:
+                raise ValueError(
+                    f"tpu_name {raw_spec.tpu_name} is in zone {target_entry.zone}, "
+                    f"not requested zone {raw_spec.zone}"
+                )
+        elif raw_spec.zone and not any(
+            raw_spec.accepts_tpu_type(entry.type)
+            and raw_spec.zone == entry.zone
+            for entry in fleet.tpus
+        ):
+            raise ValueError(
+                f"zone {raw_spec.zone} has no declared fleet capacity allowed by "
+                f"tpu={raw_spec.tpu}"
+            )
+
+    regional_specs: list[JobSpec] = []
+    bucket_locations: dict[str, str] = {}
+    for raw_spec in raw_specs:
+        target_entry = known_tpus.get(raw_spec.tpu_name) if raw_spec.tpu_name else None
+
+        def resolve(storage_bucket: str) -> str:
+            if storage_bucket not in bucket_locations:
+                bucket_locations[storage_bucket] = gcloud_bucket_location(
+                    storage_bucket,
+                    project=project,
+                )
+            return bucket_locations[storage_bucket]
+
+        bucket_regions = resolve_regional_buckets(
+            raw_spec.buckets,
+            resolve_bucket_location=resolve,
+        )
+        validate_job_gcs_dependencies(
+            raw_spec,
+            bucket_regions=bucket_regions,
+            resolve_bucket_location=resolve,
+        )
+        required_region = ""
+        if target_entry is not None:
+            required_region = region_from_zone(target_entry.zone)
+        elif raw_spec.zone:
+            required_region = region_from_zone(raw_spec.zone)
+        available_regions = {region for region, _ in bucket_regions}
+        if required_region and required_region not in available_regions:
+            raise ValueError(
+                f"job {raw_spec.id!r} has no bucket in required region "
+                f"{required_region!r}"
+            )
+        compatible_regions = {
+            region_from_zone(entry.zone)
+            for entry in fleet.tpus
+            if raw_spec.accepts_tpu_type(entry.type)
+            and (not raw_spec.zone or raw_spec.zone == entry.zone)
+        }
+        if not available_regions & compatible_regions:
+            raise ValueError(
+                f"job {raw_spec.id!r} has no compatible fleet capacity in its "
+                "bucket regions"
+            )
+        regional_specs.append(
+            replace(
+                raw_spec,
+                bucket_regions=bucket_regions,
+            )
+        )
+
+    artifacts = GCSArtifactClient()
+    prepared: list[tuple[JobRecord, tuple[str, ...]]] = []
+    submission_token = uuid.uuid4().hex
+    for raw_spec in regional_specs:
+        regional_bundles = publish_regional_bundles(
+            raw_spec.bundle,
+            base_dir=source_path.parent,
+            bucket_regions=raw_spec.bucket_regions,
+            project=project,
+        )
+        spec = replace(
+            raw_spec,
+            bundle="",
+            regional_bundles=regional_bundles,
+        )
+        submitted_at = datetime.now(timezone.utc).isoformat()
+        record = JobRecord(spec=spec, submitted_at=submitted_at)
+        spec_path = Path(tempfile.mkdtemp(prefix="tpu-runner-job-")) / "spec.json"
+        spec_path.write_text(
+            json.dumps(
+                {
+                    "submitted_at": submitted_at,
+                    "job": job_record_to_dict(record),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        spec_uris = tuple(
+            f"{bucket}/jobs/{spec.id}/spec-{submission_token}.json"
+            for _, bucket in spec.bucket_regions
+        )
+        for spec_uri in spec_uris:
+            artifacts.upload(spec_path, spec_uri)
+        prepared.append((record, spec_uris))
+
+    records = [record for record, _ in prepared]
+    store.create_jobs(records)
+    try:
+        for record, spec_uris in prepared:
+            spec = record.spec
+            submitted_at = record.submitted_at
+            store.record_event(
+                "job_submitted",
+                {
+                    "job_id": spec.id,
+                    "regional_bundles": dict(spec.regional_bundles),
+                    "spec_uris": list(spec_uris),
+                    "submitted_at": submitted_at,
+                    "tpu_name": spec.tpu_name,
+                    "zone": spec.zone,
+                    "regions": [region for region, _ in spec.bucket_regions],
+                    "priority": spec.priority,
+                },
+            )
+            print(f"submitted {spec.id}")
+            for region, bundle_uri in spec.regional_bundles:
+                print(f"bundle    {region} {bundle_uri}")
+            for region, spec_uri in zip(
+                (region for region, _ in spec.bucket_regions),
+                spec_uris,
+                strict=True,
+            ):
+                print(f"spec      {region} {spec_uri}")
+    finally:
+        if records:
+            trigger_controller(fleet)
+    return 0
+
+
+def publish_regional_bundles(
+    bundle: str,
+    *,
+    base_dir: Path,
+    bucket_regions: tuple[tuple[str, str], ...],
+    project: str,
+) -> tuple[tuple[str, str], ...]:
+    if bundle.startswith("gs://"):
+        if len(bucket_regions) != 1:
+            raise ValueError("multi-region jobs require a local source bundle")
+        return ((bucket_regions[0][0], bundle),)
+    source = (base_dir / bundle).resolve()
+    if source.is_dir():
+        archive, digest = create_content_bundle(source)
+    elif source.is_file() and tarfile.is_tarfile(source):
+        archive = source
+        digest = sha256_file(source)
+    else:
+        raise ValueError(f"bundle must be a directory, tar archive, or GCS URI: {source}")
+    regional_bundles: list[tuple[str, str]] = []
+    for region, bucket in bucket_regions:
+        uri = f"{bucket}/bundles/{digest}.tar.gz"
+        exists = subprocess.run(
+            ["gcloud", "storage", "ls", uri, f"--project={project}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        ).returncode == 0
+        if not exists:
+            subprocess.run(
+                ["gcloud", "storage", "cp", str(archive), uri, f"--project={project}"],
+                check=True,
+            )
+        regional_bundles.append((region, uri))
+    return tuple(regional_bundles)
+
+
+def create_content_bundle(root: Path) -> tuple[Path, str]:
+    paths = bundle_paths(root)
+    digest = hashlib.sha256()
+    for path in paths:
+        relative = path.relative_to(root).as_posix()
+        digest.update(relative.encode())
+        digest.update(b"\0")
+        digest.update(f"{path.lstat().st_mode & 0o777:o}".encode())
+        digest.update(b"\0")
+        if path.is_symlink():
+            digest.update(b"L\0")
+            digest.update(os.readlink(path).encode())
+            digest.update(b"\0")
+        elif path.is_file():
+            digest.update(b"F\0")
+            content_digest = hashlib.sha256()
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    content_digest.update(chunk)
+            digest.update(content_digest.digest())
+        else:
+            digest.update(b"D\0")
+    hexdigest = digest.hexdigest()
+    archive = Path(tempfile.mkdtemp(prefix="tpu-runner-bundle-")) / f"{hexdigest}.tar.gz"
+    with archive.open("wb") as raw:
+        with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as compressed:
+            with tarfile.open(fileobj=compressed, mode="w") as tar:
+                for path in paths:
+                    tar.add(
+                        path,
+                        arcname=path.relative_to(root).as_posix(),
+                        recursive=False,
+                        filter=normalized_tar_info,
+                    )
+    return archive, hexdigest
+
+
+def bundle_paths(root: Path) -> list[Path]:
+    ignore_patterns = bundle_ignore_patterns(root)
+    paths: list[Path] = []
+    for current, directories, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        kept_directories: list[str] = []
+        for name in sorted(directories):
+            path = current_path / name
+            if ignored_bundle_path(path.relative_to(root), ignore_patterns):
+                continue
+            paths.append(path)
+            if not path.is_symlink():
+                kept_directories.append(name)
+        directories[:] = kept_directories
+        for name in sorted(files):
+            path = current_path / name
+            if not ignored_bundle_path(path.relative_to(root), ignore_patterns):
+                paths.append(path)
+    return sorted(paths, key=lambda item: item.relative_to(root).as_posix())
+
+
+def bundle_ignore_patterns(root: Path) -> tuple[str, ...]:
+    path = root / ".tpu-runnerignore"
+    if not path.is_file():
+        return ()
+    return tuple(
+        line
+        for raw_line in path.read_text().splitlines()
+        if (line := raw_line.strip()) and not line.startswith("#")
+    )
+
+
+def ignored_bundle_path(relative: Path, patterns: tuple[str, ...] = ()) -> bool:
+    if any(part in IGNORED_BUNDLE_NAMES for part in relative.parts) or relative.suffix == ".pyc":
+        return True
+    candidate = relative.as_posix()
+    for raw_pattern in patterns:
+        pattern = raw_pattern.strip("/")
+        if not pattern:
+            continue
+        if "/" in pattern:
+            if fnmatch.fnmatchcase(candidate, pattern):
+                return True
+        elif any(fnmatch.fnmatchcase(part, pattern) for part in relative.parts):
+            return True
+    return False
+
+
+def normalized_tar_info(info: tarfile.TarInfo) -> tarfile.TarInfo:
+    info.uid = 0
+    info.gid = 0
+    info.uname = ""
+    info.gname = ""
+    info.mtime = 0
+    return info
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def trigger_controller(fleet) -> None:
+    job = f"{fleet.name}-controller"
+    region = fleet.controller_region
+    result = subprocess.run(
+        [
+            "gcloud",
+            "run",
+            "jobs",
+            "execute",
+            job,
+            f"--region={region}",
+            f"--project={fleet.project}",
+            "--async",
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode == 0:
+        print(f"controller {job} triggered")
+    else:
+        detail = result.stderr.strip() or result.stdout.strip() or "unknown gcloud error"
+        raise RuntimeError(f"controller trigger failed: {detail}")
+
+
+def cancel_jobs(job_ids: Sequence[str], *, if_pending: bool = False) -> int:
+    fleet, _, store = runner_context()
+    exit_code = 0
+    changed = False
+    for job_id in job_ids:
+        status = (
+            store.cancel_job(job_id, if_pending=True)
+            if if_pending
+            else store.cancel_job(job_id)
+        )
+        if status is None:
+            result = {"job_id": job_id, "status": "unknown"}
+            exit_code = max(exit_code, 1)
+        elif status == "conflict":
+            result = {
+                "job_id": job_id,
+                "status": "conflict",
+                "reason": "job is no longer unassigned and pending",
+            }
+            exit_code = 2
+        else:
+            result = {"job_id": job_id, "status": status}
+            changed = changed or status in {"cancelling", "deactivated"}
+        print(json.dumps(result, sort_keys=True))
+    if changed:
+        trigger_controller(fleet)
+    return exit_code
+
+
+def set_job_priority(
+    job_id: str,
+    *,
+    priority: str,
+) -> int:
+    """Atomically reprioritize exactly one pending, unassigned job."""
+
+    fleet, _, store = runner_context()
+    status = store.reprioritize_pending_job(
+        job_id,
+        priority=priority,
+    )
+    if status is None:
+        result = {"job_id": job_id, "status": "unknown"}
+        exit_code = 1
+    elif status == "conflict":
+        result = {
+            "job_id": job_id,
+            "status": "conflict",
+            "reason": "job is no longer unassigned and pending",
+        }
+        exit_code = 2
+    else:
+        result = {
+            "job_id": job_id,
+            "status": status,
+            "priority": priority,
+        }
+        exit_code = 0
+    print(json.dumps(result, sort_keys=True))
+    if status == "reprioritized":
+        trigger_controller(fleet)
+    return exit_code
+
+
+def request_controlled_interruption(
+    *, resource_id: str, job_id: str, attempt_id: str
+) -> int:
+    fleet, _, store = runner_context()
+    eligible_fleet_entry_ids = {
+        entry.id
+        for entry in fleet.tpus
+        if not entry.adopted and entry.provisioning_model == "spot"
+    }
+    try:
+        request = store.create_interruption_request(
+            resource_id=resource_id,
+            job_id=job_id,
+            attempt_id=attempt_id,
+            eligible_fleet_entry_ids=eligible_fleet_entry_ids,
+        )
+    except (KeyError, ValueError) as exc:
+        print(f"interruption request rejected: {exc}", file=os.sys.stderr)
+        return 1
+    print(
+        json.dumps(
+            {
+                "request_id": request.id,
+                "resource_id": request.resource_id,
+                "job_id": request.job_id,
+                "attempt_id": request.attempt_id,
+                "status": request.status,
+            },
+            sort_keys=True,
+        )
+    )
+    trigger_controller(fleet)
+    return 0
+
+
+def watch_job(job_id: str) -> int:
+    fleet, project, store = runner_context()
+    seen_logs: set[str] = set()
+    previous_state = ""
+    try:
+        while True:
+            job = store.get_job(job_id)
+            if job is None:
+                print(f"unknown job: {job_id}", file=os.sys.stderr)
+                return 1
+            attempt = store.get_attempt(job.current_attempt_id) if job.current_attempt_id else None
+            state = json.dumps(
+                {
+                    "job": job.status,
+                    "attempt": attempt.status if attempt else "",
+                    "attempt_id": attempt.id if attempt else "",
+                    "resource": job.assigned_resource_id or "",
+                    "error": attempt.error_summary if attempt else "",
+                },
+                sort_keys=True,
+            )
+            if state != previous_state:
+                print(state, flush=True)
+                previous_state = state
+            try:
+                print_cloud_logs(project, fleet.name, job_id, seen_logs)
+            except RuntimeError as exc:
+                print(f"log retrieval failed: {exc}", file=os.sys.stderr)
+                return 1
+            if job.status in TERMINAL_JOB_STATES:
+                if job.spec.bucket:
+                    print(f"artifacts {job.spec.bucket}/jobs/{job_id}")
+                return 0 if job.status == "succeeded" else 1
+            time.sleep(10)
+    except KeyboardInterrupt:
+        return 130
+
+
+def show_logs(job_id: str) -> int:
+    fleet, project, store = runner_context()
+    job = store.get_job(job_id)
+    if job is None:
+        print(f"unknown job: {job_id}", file=os.sys.stderr)
+        return 1
+    attempts = [attempt for attempt in store.list_attempts() if attempt.job_id == job_id]
+    found = False
+    errors: list[str] = []
+    for attempt in attempts:
+        outcome = f"status={attempt.status}"
+        if attempt.exit_code is not None:
+            outcome += f" exit_code={attempt.exit_code}"
+        if attempt.error_summary:
+            outcome += f" error={attempt.error_summary}"
+        print(f"[{attempt.id}] {outcome}")
+        for artifact_dir, label in (("logs", "log"), ("diagnostics", "diagnostic")):
+            pattern = (
+                f"{job.spec.bucket}/jobs/{job_id}/attempts/{attempt.id}/"
+                f"{artifact_dir}/*.log"
+            )
+            listing = subprocess.run(
+                ["gcloud", "storage", "ls", pattern, f"--project={project}"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            if listing.returncode != 0:
+                output = (listing.stdout + listing.stderr).strip()
+                if "matched no objects" not in output.lower():
+                    errors.append(output or f"could not list {pattern}")
+                continue
+            for uri in listing.stdout.splitlines():
+                if not uri.strip():
+                    continue
+                found = True
+                print(f"\n[{attempt.id} {label}] {uri}")
+                read = subprocess.run(
+                    ["gcloud", "storage", "cat", uri, f"--project={project}"],
+                    text=True,
+                    check=False,
+                )
+                if read.returncode != 0:
+                    errors.append(f"could not read {uri}")
+    try:
+        print_cloud_logs(project, fleet.name, job_id, set())
+    except RuntimeError as exc:
+        errors.append(str(exc))
+    if not found:
+        if any(attempt.status in {"failed", "failed_setup"} for attempt in attempts):
+            message = "job failed; no durable worker logs or diagnostics were uploaded"
+        else:
+            message = "no durable worker logs or diagnostics uploaded yet"
+        print(message, file=os.sys.stderr)
+    for error in errors:
+        print(f"log retrieval failed: {error}", file=os.sys.stderr)
+    return 1 if errors else 0
+
+
+def cloud_log_entries(project: str, runner_name: str, job_id: str) -> list[dict]:
+    query = (
+        f'logName="projects/{project}/logs/{runner_name}-worker" '
+        f'AND jsonPayload.job_id="{job_id}"'
+    )
+    result = subprocess.run(
+        [
+            "gcloud",
+            "logging",
+            "read",
+            query,
+            f"--project={project}",
+            "--order=desc",
+            "--limit=200",
+            "--format=json",
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError((result.stdout + result.stderr).strip() or "Cloud Logging query failed")
+    if not result.stdout.strip():
+        return []
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Cloud Logging returned invalid JSON: {exc}") from exc
+    if not isinstance(payload, list):
+        raise RuntimeError("Cloud Logging returned an unexpected response")
+    return list(reversed(payload))
+
+
+def print_cloud_logs(project: str, runner_name: str, job_id: str, seen: set[str]) -> None:
+    for entry in cloud_log_entries(project, runner_name, job_id):
+        payload = entry.get("jsonPayload") or {}
+        key = str(entry.get("insertId") or (entry.get("timestamp"), payload.get("worker"), payload.get("message")))
+        if key in seen:
+            continue
+        seen.add(key)
+        timestamp = entry.get("timestamp", "")
+        worker = payload.get("worker", "worker")
+        message = str(payload.get("message", "")).rstrip()
+        print(f"{timestamp} {worker}\n{message}", flush=True)
+if __name__ == "__main__":
+    raise SystemExit(main())
