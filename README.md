@@ -55,7 +55,7 @@ In the root of the code you want to run, create `job.yaml`:
 
 ```yaml
 jobs:
-  - tpu: [v4-64, v6e-64]
+  - tpu: [v4-32, v6e-64]
     buckets:
       - gs://my-training-us-central2
       - gs://my-training-us-east1
@@ -110,4 +110,4 @@ while your application data remains in the GCS buckets you provide.
 
 Use `tpu-runner --help` for a list of all commands, or use a specific command such as `tpu-runner submit --help` for its options.
 
-PRs and feature requests are welcome. A big thank you to the [Google TPU Research Cloud (TRC) program](https://sites.research.google/trc/) for inspiring this work.
+PRs and feature requests are welcome. Thank you to the [Google TPU Research Cloud (TRC) program](https://sites.research.google/trc/) for inspiring this work.
