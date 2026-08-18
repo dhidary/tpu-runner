@@ -2,7 +2,7 @@
 
 `tpu-runner` is a job orchestrator designed to **maximize utilization of your Google Cloud TPU allocation.** 
 
-It **races capacity** requests across compatible TPU types and regions, optimally **assigns jobs**, and **retries jobs** interrupted by Spot preemptions. It also **minimizes inter-region transfer costs**, cleans the workspace for new jobs, and lets related jobs reuse local caches (e.g. for previously compiled XLA artifacts or software environments).
+It **races capacity** requests across compatible TPU types and regions, **assigns jobs** efficiently, **retries jobs** interrupted by Spot preemptions, and **automatically scales** capacity with demand. It also minimizes inter-region transfer costs, prepares a clean workspace for new jobs, and lets related jobs reuse local caches (e.g. for previously compiled XLA artifacts or software environments).
 
 We use Firestore for queue and orchestration state, GCS for source bundles and job artifacts, and a Cloud Run controller to manage TPU capacity and execution.
 
