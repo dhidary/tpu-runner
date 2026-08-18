@@ -26,7 +26,6 @@ Configure `gcloud`:
 gcloud auth login
 gcloud auth application-default login
 gcloud config set project YOUR_PROJECT_ID
-gcloud alpha compute tpus --help >/dev/null
 ```
 
 ## Set up the runner
@@ -37,7 +36,7 @@ Create an example deployment:
 tpu-runner init
 ```
 
-Edit `deployment.yaml` with your project ID, existing Secret Manager secret names, and the TPU types, zones, maximum counts, runtime versions, and chip limits you are willing to use. Counts are provisioning ceilings; TPU Runner scales capacity up and down with demand and keeps idle capacity only when `keep_warm` is enabled.
+Edit `deployment.yaml` with your project ID, existing Secret Manager secret names, and the TPU types, zones, maximum counts, runtime versions, and chip limits you are willing to use. Counts are provisioning ceilings and TPU Runner scales capacity up and down with demand, keeping idle capacity only when `keep_warm` is enabled.
 
 The default `ssh_transport: direct` creates public-IP TPUs; set it to `iap` to create private-IP TPUs and reach them through IAP tunnels instead.
 
@@ -71,8 +70,6 @@ jobs:
     command: python3 -m pip install -r requirements.txt && touch "$PIP_CACHE_DIR/.ready" && python3 train.py --data "$JOB_BUCKET/data" --checkpoints "$CHECKPOINT_GCS_DIR"
 ```
 
-- `id` is optional. When omitted, submission generates and prints one; use that
-  ID with `watch`, `logs`, and `cancel`.
 - `tpu` may contain one or several compatible TPU types to race.
 - Omit `zone` and `tpu_name` to race all compatible fleet capacity. Set `zone`
   to use one zone, or `tpu_name` to use one exact declared TPU.
@@ -83,13 +80,12 @@ jobs:
 - `bundle` is a local directory relative to `job.yaml`. TPU Runner archives and
   uploads it; use `.tpu-runnerignore` to exclude files.
 - `priority` may be `low`, `normal`, or `high`.
-- Before a new job starts, TPU Runner clears the previous runner workspace and
-  shared memory, then extracts the new bundle into a fresh directory. A directory
+- Before a new job starts, TPU Runner clears the previous runner workspace, 
+  then extracts the new bundle into a fresh directory. A directory
   declared under `caches` is preserved when it is marked `.ready` and the next job
   on that worker declares the same `key`. Configure the relevant tool, such as
   pip, to write to the cache path. Incomplete caches are discarded, and all
-  caches disappear when the TPU is deleted. Use `CHECKPOINT_GCS_DIR` for
-  durable checkpoints.
+  caches disappear when the TPU is deleted.
 - `command` runs independently on every TPU worker. Other runner-provided
   variables include `JOB_ID`, `ATTEMPT_ID`, `TPU_WORKER_HOST`,
   `TPU_WORKER_COUNT`, `JOB_DIR`, and `ATTEMPT_GCS_DIR`.
@@ -104,12 +100,13 @@ tpu-runner logs JOB_ID
 tpu-runner cancel JOB_ID
 ```
 
-
-Spot preemption and recognized infrastructure failures return a job to
+Spot preemption and infrastructure failures return a job to
 `pending` with the same region and checkpoint directory. Application and setup
 failures are terminal. TPU Runner schedules higher-priority jobs first. Within
-each priority, it considers the most constrained jobs first and moves flexible
+each priority it considers the most constrained jobs first and moves flexible
 jobs to alternative idle TPUs when that allows more jobs to run.
+TPU Runner stores job bundles, logs, diagnostics, status, and checkpoints in the job’s GCS bucket, 
+while your application data remains in the GCS buckets you provide.
 
 Use `tpu-runner --help` for a list of all commands, or use a specific command such as `tpu-runner submit --help` for its options.
 
