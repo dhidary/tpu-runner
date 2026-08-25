@@ -1,2 +1,5 @@
-google-cloud-firestore>=2.16
-PyYAML>=6.0
+google-cloud-firestore==2.28.0
+google-api-core==2.33.0
+grpcio==1.82.1
+protobuf==7.35.1
+PyYAML==6.0.3

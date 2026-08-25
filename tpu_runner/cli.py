@@ -40,6 +40,8 @@ DEFAULT_JOB_PATH = Path("job.yaml")
 CONTROLLER_RECONCILE_SECONDS = 30
 CONTROLLER_LEASE_SECONDS = 900
 CONTROLLER_LEASE_RENEW_SECONDS = 60
+GOOGLE_API_TIMEOUT_SECONDS = 90
+WATCH_POLL_SECONDS = 10
 TERMINAL_JOB_STATES = {"succeeded", "failed", "deactivated"}
 IGNORED_BUNDLE_NAMES = {
     ".git",
@@ -538,13 +540,28 @@ def bootstrap_ready(deployment_path: Path, startup_path: Path) -> int:
     return 0
 
 
+def runner_fleet():
+    deployment_path = os.environ.get("TPU_RUNNER_DEPLOYMENT", str(DEFAULT_DEPLOYMENT_PATH))
+    fleet = load_fleet_spec(materialize_path(deployment_path))
+    return fleet, fleet.project
+
+
 def runner_context():
     from .runtime import FirestoreStateStore
 
-    deployment_path = os.environ.get("TPU_RUNNER_DEPLOYMENT", str(DEFAULT_DEPLOYMENT_PATH))
-    fleet = load_fleet_spec(materialize_path(deployment_path))
+    fleet, project = runner_fleet()
     prefix = fleet.name.replace("-", "_")
-    return fleet, fleet.project, FirestoreStateStore(project=fleet.project, collection_prefix=prefix)
+    return fleet, project, FirestoreStateStore(project=project, collection_prefix=prefix)
+
+
+def google_authorized_session(project: str, *, scopes: tuple[str, ...]):
+    import google.auth
+    from google.auth.transport.requests import AuthorizedSession
+
+    credentials, _ = google.auth.default(scopes=scopes)
+    if project and hasattr(credentials, "with_quota_project"):
+        credentials = credentials.with_quota_project(project)
+    return AuthorizedSession(credentials)
 
 
 def probe_adopted_device_owners(resource_id: str) -> int:
@@ -773,7 +790,7 @@ def submit_jobs(path: Path, *, job_ids: Sequence[str] | None = None) -> int:
             raw["id"] = f"{base}-{stamp}-{uuid.uuid4().hex[:6]}"
     raw_specs = select_job_specs(job_specs_from_dict(data), job_ids)
 
-    fleet, project, store = runner_context()
+    fleet, project = runner_fleet()
     known_tpus = {
         entry.existing: entry
         for entry in fleet.tpus
@@ -786,8 +803,6 @@ def submit_jobs(path: Path, *, job_ids: Sequence[str] | None = None) -> int:
             _, tpu_name = generated_resource_names(entry, ordinal)
             known_tpus[tpu_name] = entry
     for raw_spec in raw_specs:
-        if store.get_job(raw_spec.id) is not None:
-            raise ValueError(f"job already exists: {raw_spec.id}")
         if raw_spec.tpu_name:
             target_entry = known_tpus.get(raw_spec.tpu_name)
             if target_entry is None:
@@ -867,6 +882,19 @@ def submit_jobs(path: Path, *, job_ids: Sequence[str] | None = None) -> int:
     prepared: list[tuple[JobRecord, tuple[str, ...]]] = []
     submission_token = uuid.uuid4().hex
     for raw_spec in regional_specs:
+        print(
+            json.dumps(
+                {
+                    "event": "preparing",
+                    "job_id": raw_spec.id,
+                    "priority": raw_spec.priority,
+                    "regions": [region for region, _ in raw_spec.bucket_regions],
+                    "tpu": raw_spec.tpu,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
         regional_bundles = publish_regional_bundles(
             raw_spec.bundle,
             base_dir=source_path.parent,
@@ -899,9 +927,17 @@ def submit_jobs(path: Path, *, job_ids: Sequence[str] | None = None) -> int:
             artifacts.upload(spec_path, spec_uri)
         prepared.append((record, spec_uris))
 
+    from .runtime import FirestoreStateStore
+
     records = [record for record, _ in prepared]
-    store.create_jobs(records)
+    store = FirestoreStateStore(
+        project=project,
+        collection_prefix=fleet.name.replace("-", "_"),
+    )
+    records_created = False
     try:
+        store.create_jobs(records)
+        records_created = True
         for record, spec_uris in prepared:
             spec = record.spec
             submitted_at = record.submitted_at
@@ -917,19 +953,36 @@ def submit_jobs(path: Path, *, job_ids: Sequence[str] | None = None) -> int:
                     "regions": [region for region, _ in spec.bucket_regions],
                     "priority": spec.priority,
                 },
+                emit=False,
             )
-            print(f"submitted {spec.id}")
-            for region, bundle_uri in spec.regional_bundles:
-                print(f"bundle    {region} {bundle_uri}")
-            for region, spec_uri in zip(
-                (region for region, _ in spec.bucket_regions),
-                spec_uris,
-                strict=True,
-            ):
-                print(f"spec      {region} {spec_uri}")
+            output = {
+                "bundles": dict(spec.regional_bundles),
+                "event": "submitted",
+                "job_id": spec.id,
+                "priority": spec.priority,
+                "regions": [region for region, _ in spec.bucket_regions],
+                "specs": dict(
+                    zip(
+                        (region for region, _ in spec.bucket_regions),
+                        spec_uris,
+                        strict=True,
+                    )
+                ),
+                "submitted_at": submitted_at,
+                "tpu": spec.tpu,
+            }
+            if spec.tpu_name:
+                output["tpu_name"] = spec.tpu_name
+            if spec.zone:
+                output["zone"] = spec.zone
+            print(json.dumps(output, sort_keys=True), flush=True)
     finally:
-        if records:
-            trigger_controller(fleet)
+        store.close()
+        if records_created:
+            trigger_controller(
+                fleet,
+                job_ids=tuple(record.spec.id for record in records),
+            )
     return 0
 
 
@@ -962,10 +1015,28 @@ def publish_regional_bundles(
             check=False,
         ).returncode == 0
         if not exists:
-            subprocess.run(
-                ["gcloud", "storage", "cp", str(archive), uri, f"--project={project}"],
-                check=True,
+            command = [
+                "gcloud",
+                "storage",
+                "cp",
+                str(archive),
+                uri,
+                f"--project={project}",
+            ]
+            result = subprocess.run(
+                command,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
             )
+            if result.returncode != 0:
+                raise subprocess.CalledProcessError(
+                    result.returncode,
+                    command,
+                    output=result.stdout,
+                    stderr=result.stderr,
+                )
         regional_bundles.append((region, uri))
     return tuple(regional_bundles)
 
@@ -1072,30 +1143,41 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def trigger_controller(fleet) -> None:
+def trigger_controller(fleet, *, job_ids: Sequence[str] = ()) -> None:
     job = f"{fleet.name}-controller"
     region = fleet.controller_region
-    result = subprocess.run(
-        [
-            "gcloud",
-            "run",
-            "jobs",
-            "execute",
-            job,
-            f"--region={region}",
-            f"--project={fleet.project}",
-            "--async",
-        ],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
+    session = google_authorized_session(
+        fleet.project,
+        scopes=("https://www.googleapis.com/auth/cloud-platform",),
     )
-    if result.returncode == 0:
-        print(f"controller {job} triggered")
-    else:
-        detail = result.stderr.strip() or result.stdout.strip() or "unknown gcloud error"
-        raise RuntimeError(f"controller trigger failed: {detail}")
+    try:
+        response = session.post(
+            "https://run.googleapis.com/v2/"
+            f"projects/{fleet.project}/locations/{region}/jobs/{job}:run",
+            json={},
+            timeout=GOOGLE_API_TIMEOUT_SECONDS,
+        )
+        if not response.ok:
+            detail = response.text.strip() or f"HTTP {response.status_code}"
+            raise RuntimeError(f"controller trigger failed: {detail}")
+        try:
+            operation = response.json()
+        except ValueError as exc:
+            raise RuntimeError("controller trigger returned invalid JSON") from exc
+    finally:
+        session.close()
+
+    output: dict[str, object] = {
+        "controller": job,
+        "event": "controller_triggered",
+        "region": region,
+    }
+    operation_name = operation.get("name") if isinstance(operation, dict) else None
+    if operation_name:
+        output["operation"] = operation_name
+    if job_ids:
+        output["job_ids"] = list(job_ids)
+    print(json.dumps(output, sort_keys=True), flush=True)
 
 
 def cancel_jobs(job_ids: Sequence[str], *, if_pending: bool = False) -> int:
@@ -1201,38 +1283,143 @@ def watch_job(job_id: str) -> int:
     fleet, project, store = runner_context()
     seen_logs: set[str] = set()
     previous_state = ""
+    previous_log_error = ""
+    previous_assignment: tuple[str, str] | None = None
+    entries_by_id = {entry.id: entry for entry in fleet.tpus}
+    logging_session = google_authorized_session(
+        project,
+        scopes=("https://www.googleapis.com/auth/logging.read",),
+    )
     try:
         while True:
             job = store.get_job(job_id)
             if job is None:
-                print(f"unknown job: {job_id}", file=os.sys.stderr)
+                print(
+                    json.dumps(
+                        {
+                            "error": "unknown job",
+                            "event": "error",
+                            "job_id": job_id,
+                        },
+                        sort_keys=True,
+                    ),
+                    file=os.sys.stderr,
+                )
                 return 1
             attempt = store.get_attempt(job.current_attempt_id) if job.current_attempt_id else None
-            state = json.dumps(
-                {
-                    "job": job.status,
-                    "attempt": attempt.status if attempt else "",
-                    "attempt_id": attempt.id if attempt else "",
-                    "resource": job.assigned_resource_id or "",
-                    "error": attempt.error_summary if attempt else "",
-                },
-                sort_keys=True,
+            resource_id = job.assigned_resource_id or (attempt.resource_id if attempt else "")
+            assignment = (
+                (resource_id, attempt.id if attempt else "")
+                if resource_id
+                else None
             )
-            if state != previous_state:
-                print(state, flush=True)
-                previous_state = state
+            if assignment is not None and assignment != previous_assignment:
+                resource = store.get_resource(resource_id)
+                assigned: dict[str, object] = {
+                    "attempt_id": attempt.id if attempt else "",
+                    "event": "assigned",
+                    "job_id": job_id,
+                    "resource": resource_id,
+                    "tpu_name": resource.tpu_name if resource else resource_id,
+                }
+                if resource is not None:
+                    assigned.update(
+                        {
+                            "adopted": resource.adopted,
+                            "fleet_entry": resource.fleet_entry_id or "",
+                            "tpu_type": resource.tpu_type,
+                            "worker_count": resource.worker_count,
+                            "zone": resource.zone,
+                        }
+                    )
+                    entry = entries_by_id.get(resource.fleet_entry_id or "")
+                    if entry is not None:
+                        assigned["provisioning_model"] = entry.provisioning_model
+                print(json.dumps(assigned, sort_keys=True), flush=True)
+            previous_assignment = assignment
+
+            state_fields: dict[str, object] = {
+                "attempt": attempt.status if attempt else "",
+                "attempt_id": attempt.id if attempt else "",
+                "job": job.status,
+                "job_id": job_id,
+                "priority": job.spec.priority,
+                "resource": resource_id,
+                "tpu": job.spec.tpu,
+            }
+            if attempt is not None:
+                if attempt.exit_code is not None:
+                    state_fields["exit_code"] = attempt.exit_code
+                if attempt.error_summary:
+                    state_fields["error"] = attempt.error_summary
+                if attempt.end_reason:
+                    state_fields["end_reason"] = attempt.end_reason
+            if job.spec.storage_region:
+                state_fields["region"] = job.spec.storage_region
+            if job.spec.bucket:
+                state_fields["bucket"] = job.spec.bucket
+            state = json.dumps(state_fields, sort_keys=True)
+            output = dict(state_fields)
+            output["checked_at"] = datetime.now(timezone.utc).isoformat()
+            output["event"] = "state" if state != previous_state else "poll"
+            print(json.dumps(output, sort_keys=True), flush=True)
+            previous_state = state
             try:
-                print_cloud_logs(project, fleet.name, job_id, seen_logs)
+                print_cloud_logs(
+                    project,
+                    fleet.name,
+                    job_id,
+                    seen_logs,
+                    session=logging_session,
+                )
+                if previous_log_error:
+                    print(
+                        json.dumps(
+                            {
+                                "event": "logs_recovered",
+                                "job_id": job_id,
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
+                    previous_log_error = ""
             except RuntimeError as exc:
-                print(f"log retrieval failed: {exc}", file=os.sys.stderr)
-                return 1
+                error = str(exc)
+                if error != previous_log_error:
+                    print(
+                        json.dumps(
+                            {
+                                "error": error,
+                                "event": "log_warning",
+                                "job_id": job_id,
+                            },
+                            sort_keys=True,
+                        ),
+                        file=os.sys.stderr,
+                        flush=True,
+                    )
+                previous_log_error = error
             if job.status in TERMINAL_JOB_STATES:
                 if job.spec.bucket:
-                    print(f"artifacts {job.spec.bucket}/jobs/{job_id}")
+                    print(
+                        json.dumps(
+                            {
+                                "event": "artifacts",
+                                "job_id": job_id,
+                                "uri": f"{job.spec.bucket}/jobs/{job_id}",
+                            },
+                            sort_keys=True,
+                        ),
+                        flush=True,
+                    )
                 return 0 if job.status == "succeeded" else 1
-            time.sleep(10)
+            time.sleep(WATCH_POLL_SECONDS)
     except KeyboardInterrupt:
         return 130
+    finally:
+        logging_session.close()
+        store.close()
 
 
 def show_logs(job_id: str) -> int:
@@ -1295,42 +1482,76 @@ def show_logs(job_id: str) -> int:
     return 1 if errors else 0
 
 
-def cloud_log_entries(project: str, runner_name: str, job_id: str) -> list[dict]:
+def cloud_log_entries(
+    project: str,
+    runner_name: str,
+    job_id: str,
+    *,
+    session=None,
+) -> list[dict]:
     query = (
-        f'logName="projects/{project}/logs/{runner_name}-worker" '
-        f'AND jsonPayload.job_id="{job_id}"'
+        "logName="
+        + json.dumps(f"projects/{project}/logs/{runner_name}-worker")
+        + " AND jsonPayload.job_id="
+        + json.dumps(job_id)
     )
-    result = subprocess.run(
-        [
-            "gcloud",
-            "logging",
-            "read",
-            query,
-            f"--project={project}",
-            "--order=desc",
-            "--limit=200",
-            "--format=json",
-        ],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError((result.stdout + result.stderr).strip() or "Cloud Logging query failed")
-    if not result.stdout.strip():
-        return []
+    owns_session = session is None
+    if session is None:
+        session = google_authorized_session(
+            project,
+            scopes=("https://www.googleapis.com/auth/logging.read",),
+        )
     try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Cloud Logging returned invalid JSON: {exc}") from exc
-    if not isinstance(payload, list):
-        raise RuntimeError("Cloud Logging returned an unexpected response")
-    return list(reversed(payload))
+        body: dict[str, object] = {
+            "filter": query,
+            "orderBy": "timestamp desc",
+            "pageSize": 200,
+            "resourceNames": [f"projects/{project}"],
+        }
+        entries: list[dict] = []
+        for _ in range(5):
+            response = session.post(
+                "https://logging.googleapis.com/v2/entries:list",
+                json=body,
+                timeout=GOOGLE_API_TIMEOUT_SECONDS,
+            )
+            if not response.ok:
+                detail = response.text.strip() or f"HTTP {response.status_code}"
+                raise RuntimeError(f"Cloud Logging query failed: {detail}")
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise RuntimeError("Cloud Logging returned invalid JSON") from exc
+            if not isinstance(payload, dict):
+                raise RuntimeError("Cloud Logging returned an unexpected response")
+            page_entries = payload.get("entries", [])
+            if not isinstance(page_entries, list):
+                raise RuntimeError("Cloud Logging returned invalid entries")
+            entries.extend(item for item in page_entries if isinstance(item, dict))
+            page_token = payload.get("nextPageToken")
+            if entries or not isinstance(page_token, str) or not page_token:
+                break
+            body["pageToken"] = page_token
+        return list(reversed(entries[:200]))
+    finally:
+        if owns_session:
+            session.close()
 
 
-def print_cloud_logs(project: str, runner_name: str, job_id: str, seen: set[str]) -> None:
-    for entry in cloud_log_entries(project, runner_name, job_id):
+def print_cloud_logs(
+    project: str,
+    runner_name: str,
+    job_id: str,
+    seen: set[str],
+    *,
+    session=None,
+) -> None:
+    for entry in cloud_log_entries(
+        project,
+        runner_name,
+        job_id,
+        session=session,
+    ):
         payload = entry.get("jsonPayload") or {}
         key = str(entry.get("insertId") or (entry.get("timestamp"), payload.get("worker"), payload.get("message")))
         if key in seen:
@@ -1338,7 +1559,11 @@ def print_cloud_logs(project: str, runner_name: str, job_id: str, seen: set[str]
         seen.add(key)
         timestamp = entry.get("timestamp", "")
         worker = payload.get("worker", "worker")
+        attempt_id = payload.get("attempt_id", "")
         message = str(payload.get("message", "")).rstrip()
-        print(f"{timestamp} {worker}\n{message}", flush=True)
+        header = f"{timestamp} job_id={job_id} worker={worker}"
+        if attempt_id:
+            header += f" attempt_id={attempt_id}"
+        print(f"{header}\n{message}", flush=True)
 if __name__ == "__main__":
     raise SystemExit(main())

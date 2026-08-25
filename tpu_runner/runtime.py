@@ -197,6 +197,9 @@ class FirestoreStateStore:
     def _collection(self, name: str):
         return self.client.collection(f"{self.prefix}_{name}")
 
+    def close(self) -> None:
+        self.client.close()
+
     def upsert_resource(self, resource: ResourceRecord) -> None:
         self._collection("resources").document(resource.id).set(asdict(resource))
 
@@ -771,14 +774,15 @@ class FirestoreStateStore:
 
         return reset(self.client.transaction())
 
-    def record_event(self, kind: str, payload: dict) -> None:
+    def record_event(self, kind: str, payload: dict, *, emit: bool = True) -> None:
         event = {
             "kind": kind,
             "payload": payload,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         self._collection("events").add(event)
-        print(json.dumps(event, sort_keys=True), flush=True)
+        if emit:
+            print(json.dumps(event, sort_keys=True), flush=True)
 
     def acquire_lease(
         self,
@@ -862,7 +866,21 @@ class FirestoreStateStore:
 
 class GCSArtifactClient:
     def upload(self, source: Path, uri: str) -> None:
-        subprocess.run(["gcloud", "storage", "cp", str(source), uri], check=True)
+        command = ["gcloud", "storage", "cp", str(source), uri]
+        result = subprocess.run(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(
+                result.returncode,
+                command,
+                output=result.stdout,
+                stderr=result.stderr,
+            )
 
 
 def checkpoint_dir(bucket: str, job_id: str) -> str:
