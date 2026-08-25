@@ -332,7 +332,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "controller":
         from .controller import Controller
-        from .gcp import SubprocessGCPClient
+        from .gcp import ConcurrentInventoryGCPClient
         from .runtime import FirestoreStateStore
 
         require_controller_ssh_identity(os.environ)
@@ -361,7 +361,7 @@ def main(argv: list[str] | None = None) -> int:
         controller = Controller(
             fleet=fleet,
             store=store,
-            gcp=SubprocessGCPClient(fleet=fleet),
+            gcp=ConcurrentInventoryGCPClient(fleet=fleet),
             renew_lease=lease_renewer.renew,
         )
         try:

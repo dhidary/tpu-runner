@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import subprocess
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
+
 from .specs import FleetSpec, TPUEntry, slugify, stable_id
 
 GCLOUD_LIST_TIMEOUT_SECONDS = 90
 GCLOUD_MUTATION_TIMEOUT_SECONDS = 300
+TPU_API_ROOT = "https://tpu.googleapis.com"
+TPU_API_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 
 
 PENDING_QUEUED_RESOURCE_STATES = {
@@ -130,6 +137,24 @@ class SubprocessGCPClient:
         )
         return [parse_queued_resource(payload) for payload in payloads]
 
+    def list_inventory(
+        self,
+        project: str | None = None,
+        *,
+        additional_tpu_targets: tuple[tuple[str, str], ...] = (),
+        additional_queued_targets: tuple[tuple[str, str], ...] = (),
+    ) -> tuple[list[TPUVM], list[QueuedResource]]:
+        return (
+            self.list_tpus(
+                project=project,
+                additional_targets=additional_tpu_targets,
+            ),
+            self.list_queued_resources(
+                project=project,
+                additional_targets=additional_queued_targets,
+            ),
+        )
+
     def create_queued_resource(
         self,
         *,
@@ -183,6 +208,75 @@ class SubprocessGCPClient:
         if project:
             command.append(f"--project={project}")
         run_idempotent_delete(command)
+
+
+class GCPInventoryError(subprocess.SubprocessError):
+    """A retryable failure while reading exact Cloud TPU inventory."""
+
+
+class ConcurrentInventoryGCPClient(SubprocessGCPClient):
+    """Use exact concurrent Cloud TPU API reads and gcloud mutations."""
+
+    def __init__(
+        self,
+        *,
+        fleet: FleetSpec,
+        credentials=None,
+        auth_request=None,
+        urlopen=None,
+    ) -> None:
+        super().__init__(fleet=fleet)
+        if credentials is None:
+            import google.auth
+
+            credentials, _ = google.auth.default(scopes=(TPU_API_SCOPE,))
+        if auth_request is None:
+            from google.auth.transport.requests import Request
+
+            auth_request = Request()
+        self.credentials = credentials
+        self.auth_request = auth_request
+        self.urlopen = urlopen or urllib.request.urlopen
+
+    def list_inventory(
+        self,
+        project: str | None = None,
+        *,
+        additional_tpu_targets: tuple[tuple[str, str], ...] = (),
+        additional_queued_targets: tuple[tuple[str, str], ...] = (),
+    ) -> tuple[list[TPUVM], list[QueuedResource]]:
+        project = project or self.fleet.project
+        if not project:
+            raise ValueError("inventory reads require a project")
+        tpu_targets = merge_inventory_targets(
+            declared_tpu_targets(self.fleet), additional_tpu_targets
+        )
+        queued_targets = merge_inventory_targets(
+            declared_queued_resource_targets(self.fleet), additional_queued_targets
+        )
+        headers = {"Accept": "application/json"}
+        try:
+            self.credentials.before_request(
+                self.auth_request,
+                "GET",
+                TPU_API_ROOT,
+                headers,
+            )
+        except Exception as exc:
+            raise GCPInventoryError(
+                f"Cloud TPU API authentication failed: {exc}"
+            ) from exc
+        tpu_payloads, queued_payloads = describe_api_inventory_targets(
+            project=project,
+            tpu_targets=tpu_targets,
+            queued_targets=queued_targets,
+            headers=headers,
+            urlopen=self.urlopen,
+        )
+        return (
+            [parse_tpu_vm(payload) for payload in tpu_payloads],
+            [parse_queued_resource(payload) for payload in queued_payloads],
+        )
 
 
 def run_idempotent_delete(command: list[str]) -> None:
@@ -299,6 +393,84 @@ def describe_inventory_targets(
     # a background gRPC poller, and forking gcloud children from worker threads
     # can inherit its file descriptors and destabilize the long-lived process.
     return [payload for target in targets if (payload := describe(target))]
+
+
+def describe_api_inventory_targets(
+    *,
+    project: str,
+    tpu_targets: tuple[tuple[str, str], ...],
+    queued_targets: tuple[tuple[str, str], ...],
+    headers: dict[str, str],
+    urlopen,
+) -> tuple[list[dict], list[dict]]:
+    """Read every exact node and queued-resource target simultaneously."""
+
+    targets = tuple(
+        [("node", name, zone) for name, zone in tpu_targets]
+        + [("queued_resource", name, zone) for name, zone in queued_targets]
+    )
+    if not targets:
+        return [], []
+
+    def describe(target: tuple[str, str, str]) -> tuple[str, dict] | None:
+        kind, name, zone = target
+        if kind == "node":
+            version = "v2"
+            resource = "nodes"
+        else:
+            version = "v2alpha1"
+            resource = "queuedResources"
+        path = "/".join(
+            urllib.parse.quote(part, safe="")
+            for part in (
+                "projects",
+                project,
+                "locations",
+                zone,
+                resource,
+                name,
+            )
+        )
+        url = f"{TPU_API_ROOT}/{version}/{path}"
+        request = urllib.request.Request(url, headers=dict(headers), method="GET")
+        try:
+            with urlopen(request, timeout=GCLOUD_LIST_TIMEOUT_SECONDS) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return None
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise GCPInventoryError(
+                f"Cloud TPU API GET failed for exact {kind} {zone}/{name}: "
+                f"HTTP {exc.code}: {detail}"
+            ) from exc
+        except (TimeoutError, urllib.error.URLError) as exc:
+            raise GCPInventoryError(
+                f"Cloud TPU API GET failed for exact {kind} {zone}/{name}: {exc}"
+            ) from exc
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise GCPInventoryError(
+                f"Cloud TPU API returned invalid JSON for exact {kind} {zone}/{name}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise GCPInventoryError(
+                f"Cloud TPU API returned an invalid payload for exact {kind} {zone}/{name}"
+            )
+        return kind, payload
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(targets)) as pool:
+        described = list(pool.map(describe, targets))
+    tpus: list[dict] = []
+    queued: list[dict] = []
+    for item in described:
+        if item is None:
+            continue
+        kind, payload = item
+        if kind == "node":
+            tpus.append(payload)
+        else:
+            queued.append(payload)
+    return tpus, queued
 
 
 def is_not_found_output(output: str) -> bool:

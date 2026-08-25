@@ -1,23 +1,24 @@
 from __future__ import annotations
 
+import json
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from .gcp import (
-    QueuedResource,
-    SubprocessGCPClient,
-    TPUVM,
-    generated_resource_names,
-    resource_matches_entry,
-)
 from .capacity_policy import (
     desired_managed_capacity_counts,
     pending_job_accepts_entry,
     plan_idle_assignments,
     resource_is_busy,
 )
-from .specs import FleetSpec, region_from_zone, tpu_family_and_chips
+from .gcp import (
+    TPUVM,
+    QueuedResource,
+    SubprocessGCPClient,
+    generated_resource_names,
+    resource_matches_entry,
+)
 from .runtime import (
     AttemptRecord,
     FirestoreStateStore,
@@ -26,6 +27,7 @@ from .runtime import (
     ResourceRecord,
     validate_interruption_target,
 )
+from .specs import FleetSpec, region_from_zone, tpu_family_and_chips
 
 CANCELLATION_RECYCLE_THRESHOLD = 2
 MANAGED_SPOT_LAUNCH_ACCESS_TIMEOUT_SECONDS = 30 * 60
@@ -55,6 +57,7 @@ class Controller:
     store: FirestoreStateStore
     gcp: SubprocessGCPClient
     renew_lease: Callable[[], bool] | None = None
+    _inventory_reported: bool = field(default=False, init=False, repr=False)
 
     def heartbeat(self) -> None:
         """Renew the controller lease between bounded remote operations."""
@@ -79,14 +82,26 @@ class Controller:
             for resource in inventory_resources
             if not resource.adopted
         )
-        tpus = self.gcp.list_tpus(
+        inventory_started = time.monotonic()
+        tpus, queued = self.gcp.list_inventory(
             project=self.fleet.project,
-            additional_targets=tpu_targets,
+            additional_tpu_targets=tpu_targets,
+            additional_queued_targets=queued_targets,
         )
-        queued = self.gcp.list_queued_resources(
-            project=self.fleet.project,
-            additional_targets=queued_targets,
-        )
+        if not self._inventory_reported:
+            print(
+                json.dumps(
+                    {
+                        "event": "controller_inventory",
+                        "queued_resources_found": len(queued),
+                        "seconds": round(time.monotonic() - inventory_started, 3),
+                        "tpus_found": len(tpus),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            self._inventory_reported = True
         self.heartbeat()
         self.refresh_queued_resources(queued)
         self.refresh_ready_resources(tpus)
@@ -592,7 +607,7 @@ class Controller:
 
     def recover_idle_adopted_disk_pressure(self, tpus: list[TPUVM]) -> None:
         """Recover runner scratch only on idle adopted TPUs with unhealthy runtime health."""
-        from .distributed import DistributedTPURunner, MINIMUM_ROOT_FREE_KB
+        from .distributed import MINIMUM_ROOT_FREE_KB, DistributedTPURunner
 
         entries = {entry.id: entry for entry in self.fleet.tpus}
         resources = {resource.tpu_name: resource for resource in self.store.list_resources()}
