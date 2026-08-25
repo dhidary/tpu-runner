@@ -118,7 +118,7 @@ class Controller:
         self.heartbeat()
         self.reconcile_managed_spot_recycles(tpus, queued)
         self.reconcile_unusable_resources(tpus, queued)
-        self.assign_pending_jobs()
+        assigned_attempt_ids = self.assign_pending_jobs()
         self.heartbeat()
         self.reconcile_capacity(tpus, queued)
         # A controlled interruption can be requested while the first attempt
@@ -127,7 +127,9 @@ class Controller:
         # not starved behind another full round of SSH timeouts.
         self.reconcile_interruption_requests(tpus, queued)
         self.heartbeat()
-        self.reconcile_controller_managed_attempts()
+        self.reconcile_controller_managed_attempts(
+            attempt_ids=assigned_attempt_ids
+        )
 
     def reconcile_managed_spot_recycles(
         self,
@@ -1175,16 +1177,13 @@ class Controller:
             if resource_is_inventory_owned_for_fleet(resource, self.fleet)
             and resource.status not in {"deleted", "preempted"}
         ]
-        tpus = self.gcp.list_tpus(
+        tpus, queued = self.gcp.list_inventory(
             project=self.fleet.project,
-            additional_targets=tuple(
+            additional_tpu_targets=tuple(
                 (resource.tpu_name, resource.zone)
                 for resource in inventory_resources
             ),
-        )
-        queued = self.gcp.list_queued_resources(
-            project=self.fleet.project,
-            additional_targets=tuple(
+            additional_queued_targets=tuple(
                 (f"qr-{resource.tpu_name}", resource.zone)
                 for resource in inventory_resources
                 if not resource.adopted
@@ -1196,7 +1195,8 @@ class Controller:
             for resource in [*tpus, *queued]
         )
 
-    def assign_pending_jobs(self) -> None:
+    def assign_pending_jobs(self) -> set[str]:
+        assigned_attempt_ids: set[str] = set()
         resources = [
             resource
             for resource in self.store.list_resources()
@@ -1212,6 +1212,7 @@ class Controller:
             attempt = self.store.assign_job(job.spec.id, resource.id)
             if attempt is None:
                 continue
+            assigned_attempt_ids.add(attempt.id)
             selected_region = region_from_zone(resource.zone)
             self.store.record_event(
                 "job_assigned",
@@ -1225,10 +1226,15 @@ class Controller:
                     "priority": job.spec.priority,
                 },
             )
+        return assigned_attempt_ids
 
-    def reconcile_controller_managed_attempts(self) -> None:
+    def reconcile_controller_managed_attempts(
+        self, *, attempt_ids: set[str] | None = None
+    ) -> None:
         from .distributed import DistributedTPURunner, TemporaryAccessError
 
+        if attempt_ids is not None and not attempt_ids:
+            return
         runner = DistributedTPURunner(
             name=self.fleet.name,
             project=self.fleet.project,
@@ -1237,6 +1243,8 @@ class Controller:
         for job in self.store.list_jobs_with_statuses({"running"}):
             self.heartbeat()
             if not job.current_attempt_id or not job.assigned_resource_id:
+                continue
+            if attempt_ids is not None and job.current_attempt_id not in attempt_ids:
                 continue
             attempt = self.store.get_attempt(job.current_attempt_id)
             resource = self.store.get_resource(job.assigned_resource_id)

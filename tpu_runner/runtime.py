@@ -206,6 +206,16 @@ class FirestoreStateStore:
     def list_resources(self) -> list[ResourceRecord]:
         return [ResourceRecord(**doc.to_dict()) for doc in self._collection("resources").stream()]
 
+    def list_resources_excluding_statuses(
+        self, statuses: set[str] | frozenset[str]
+    ) -> list[ResourceRecord]:
+        from google.cloud.firestore_v1.base_query import FieldFilter
+
+        query = self._collection("resources").where(
+            filter=FieldFilter("status", "not-in", sorted(statuses))
+        )
+        return [ResourceRecord(**doc.to_dict()) for doc in query.stream()]
+
     def get_resource(self, resource_id: str) -> ResourceRecord | None:
         snapshot = self._collection("resources").document(resource_id).get()
         return ResourceRecord(**snapshot.to_dict()) if snapshot.exists else None
@@ -226,9 +236,6 @@ class FirestoreStateStore:
                 transaction.set(ref, job_record_to_dict(job))
 
         create(self.client.transaction())
-
-    def list_jobs(self) -> list[JobRecord]:
-        return [job_record_from_dict(doc.to_dict()) for doc in self._collection("jobs").stream()]
 
     def list_jobs_with_statuses(self, statuses: set[str] | frozenset[str]) -> list[JobRecord]:
         from google.cloud.firestore_v1.base_query import FieldFilter
@@ -347,8 +354,13 @@ class FirestoreStateStore:
         snapshot = self._collection("attempts").document(attempt_id).get()
         return attempt_record_from_dict(snapshot.to_dict()) if snapshot.exists else None
 
-    def list_attempts(self) -> list[AttemptRecord]:
-        return [attempt_record_from_dict(doc.to_dict()) for doc in self._collection("attempts").stream()]
+    def list_attempts_for_job(self, job_id: str) -> list[AttemptRecord]:
+        from google.cloud.firestore_v1.base_query import FieldFilter
+
+        query = self._collection("attempts").where(
+            filter=FieldFilter("job_id", "==", job_id)
+        )
+        return [attempt_record_from_dict(doc.to_dict()) for doc in query.stream()]
 
     def create_interruption_request(
         self,
@@ -410,12 +422,6 @@ class FirestoreStateStore:
             return request
 
         return create(self.client.transaction())
-
-    def list_interruption_requests(self) -> list[InterruptionRequestRecord]:
-        return [
-            interruption_request_from_dict(doc.to_dict())
-            for doc in self._collection("interruption_requests").stream()
-        ]
 
     def list_interruption_requests_with_statuses(
         self, statuses: set[str] | frozenset[str]

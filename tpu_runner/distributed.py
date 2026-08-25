@@ -462,42 +462,30 @@ echo "TPU_RUNNER_DISK_RECOVERY $HOST RECOVERED $free_kb_before $free_kb_after $w
     def read_gcs_statuses(self, *, job: JobSpec, attempt: AttemptRecord) -> dict[str, dict]:
         bucket = job_bucket(job)
         pattern = f"{bucket}/jobs/{job.id}/attempts/{attempt.id}/status/*.json"
-        command = ["gcloud", "storage", "ls", pattern]
+        command = ["gcloud", "storage", "cat", pattern]
         if self.project:
             command.append(f"--project={self.project}")
-        listing = subprocess.run(
+        result = subprocess.run(
             command,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
         )
-        output = listing.stdout + listing.stderr
-        if listing.returncode != 0:
+        output = result.stdout + result.stderr
+        if result.returncode != 0:
             if "matched no objects" in output.lower():
                 return {}
-            raise TemporaryAccessError(output.strip() or "could not list worker status objects")
+            raise TemporaryAccessError(output.strip() or "could not read worker status objects")
 
         statuses: dict[str, dict] = {}
-        for uri in (line.strip() for line in listing.stdout.splitlines()):
-            if not uri:
+        for line in result.stdout.splitlines():
+            if not line.strip():
                 continue
-            cat_command = ["gcloud", "storage", "cat", uri]
-            if self.project:
-                cat_command.append(f"--project={self.project}")
-            result = subprocess.run(
-                cat_command,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
-            if result.returncode != 0:
-                raise TemporaryAccessError(result.stderr.strip() or f"could not read {uri}")
             try:
-                status = json.loads(result.stdout)
+                status = json.loads(line)
             except json.JSONDecodeError as exc:
-                raise TemporaryAccessError(f"worker status is not valid JSON: {uri}") from exc
+                raise TemporaryAccessError("worker status is not valid JSON") from exc
             host = str(status.get("host", ""))
             if host:
                 statuses[host] = status

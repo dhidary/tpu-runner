@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 
 from .specs import FleetSpec, TPUEntry, slugify, stable_id
 
-GCLOUD_LIST_TIMEOUT_SECONDS = 90
+INVENTORY_TIMEOUT_SECONDS = 90
 GCLOUD_MUTATION_TIMEOUT_SECONDS = 300
 TPU_API_ROOT = "https://tpu.googleapis.com"
 TPU_API_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
@@ -105,38 +105,6 @@ class SubprocessGCPClient:
     def __init__(self, *, fleet: FleetSpec):
         self.fleet = fleet
 
-    def list_tpus(
-        self,
-        project: str | None = None,
-        *,
-        additional_targets: tuple[tuple[str, str], ...] = (),
-    ) -> list[TPUVM]:
-        targets = merge_inventory_targets(
-            declared_tpu_targets(self.fleet), additional_targets
-        )
-        payloads = describe_inventory_targets(
-            targets,
-            resource_args=("tpu-vm",),
-            project=project,
-        )
-        return [parse_tpu_vm(payload) for payload in payloads]
-
-    def list_queued_resources(
-        self,
-        project: str | None = None,
-        *,
-        additional_targets: tuple[tuple[str, str], ...] = (),
-    ) -> list[QueuedResource]:
-        targets = merge_inventory_targets(
-            declared_queued_resource_targets(self.fleet), additional_targets
-        )
-        payloads = describe_inventory_targets(
-            targets,
-            resource_args=("queued-resources",),
-            project=project,
-        )
-        return [parse_queued_resource(payload) for payload in payloads]
-
     def list_inventory(
         self,
         project: str | None = None,
@@ -144,16 +112,7 @@ class SubprocessGCPClient:
         additional_tpu_targets: tuple[tuple[str, str], ...] = (),
         additional_queued_targets: tuple[tuple[str, str], ...] = (),
     ) -> tuple[list[TPUVM], list[QueuedResource]]:
-        return (
-            self.list_tpus(
-                project=project,
-                additional_targets=additional_tpu_targets,
-            ),
-            self.list_queued_resources(
-                project=project,
-                additional_targets=additional_queued_targets,
-            ),
-        )
+        raise NotImplementedError
 
     def create_queued_resource(
         self,
@@ -345,56 +304,6 @@ def merge_inventory_targets(
     )
 
 
-def describe_inventory_targets(
-    targets: tuple[tuple[str, str], ...],
-    *,
-    resource_args: tuple[str, ...],
-    project: str | None,
-) -> list[dict]:
-    """Describe only exact declared names, in parallel, ignoring absence."""
-
-    def describe(target: tuple[str, str]) -> dict | None:
-        name, zone = target
-        command = [
-            "gcloud",
-            "alpha",
-            "compute",
-            "tpus",
-            *resource_args,
-            "describe",
-            name,
-            f"--zone={zone}",
-            "--format=json",
-        ]
-        if project:
-            command.append(f"--project={project}")
-        process = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=GCLOUD_LIST_TIMEOUT_SECONDS,
-        )
-        if process.returncode == 0:
-            return json.loads(process.stdout)
-        output = "\n".join(
-            part for part in (process.stdout, process.stderr) if part
-        )
-        if is_not_found_output(output):
-            return None
-        raise subprocess.CalledProcessError(
-            process.returncode,
-            command,
-            output=process.stdout,
-            stderr=process.stderr,
-        )
-
-    # Keep subprocess creation on the controller's main thread. Firestore uses
-    # a background gRPC poller, and forking gcloud children from worker threads
-    # can inherit its file descriptors and destabilize the long-lived process.
-    return [payload for target in targets if (payload := describe(target))]
-
-
 def describe_api_inventory_targets(
     *,
     project: str,
@@ -434,7 +343,7 @@ def describe_api_inventory_targets(
         url = f"{TPU_API_ROOT}/{version}/{path}"
         request = urllib.request.Request(url, headers=dict(headers), method="GET")
         try:
-            with urlopen(request, timeout=GCLOUD_LIST_TIMEOUT_SECONDS) as response:
+            with urlopen(request, timeout=INVENTORY_TIMEOUT_SECONDS) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
@@ -471,15 +380,6 @@ def describe_api_inventory_targets(
         else:
             queued.append(payload)
     return tpus, queued
-
-
-def is_not_found_output(output: str) -> bool:
-    lowered = output.lower()
-    return (
-        "not_found" in lowered
-        or "was not found" in lowered
-        or "could not fetch resource" in lowered
-    )
 
 
 def build_create_queued_resource_command(

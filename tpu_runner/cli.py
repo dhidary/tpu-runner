@@ -236,7 +236,9 @@ def main(argv: list[str] | None = None) -> int:
         "--resource-id", required=True, help="adopted TPU resource ID"
     )
 
-    status_parser = sub.add_parser("status", help="emit read-only fleet state as JSON")
+    status_parser = sub.add_parser(
+        "status", help="emit read-only active fleet state as JSON"
+    )
     status_parser.add_argument(
         "--deployment",
         default=str(DEFAULT_DEPLOYMENT_PATH),
@@ -348,6 +350,7 @@ def main(argv: list[str] | None = None) -> int:
         ):
             store.record_event("controller_skipped", {"reason": "lease_held", "owner": owner})
             print(json.dumps({"status": "skipped", "reason": "lease_held"}))
+            store.close()
             return 0
         lease_renewer = ControllerLeaseRenewer(
             store=store,
@@ -411,7 +414,10 @@ def main(argv: list[str] | None = None) -> int:
                 controller.renew_lease = lease_renewer.renew
         finally:
             lease_renewer.stop()
-            store.release_lease(lease_name, owner)
+            try:
+                store.release_lease(lease_name, owner)
+            finally:
+                store.close()
     if args.command == "bootstrap-ready":
         return bootstrap_ready(Path(args.deployment), Path(args.startup))
     if args.command == "deploy":
@@ -444,7 +450,10 @@ def main(argv: list[str] | None = None) -> int:
             collection_prefix=fleet.name.replace("-", "_"),
             project=fleet.project,
         )
-        store.release_lease("controller", args.owner)
+        try:
+            store.release_lease("controller", args.owner)
+        finally:
+            store.close()
         print(json.dumps({"status": "released_if_owned", "owner": args.owner}))
         return 0
     if args.command == "wait-controller-release":
@@ -458,18 +467,21 @@ def main(argv: list[str] | None = None) -> int:
             project=fleet.project,
         )
         deadline = time.monotonic() + args.timeout_seconds
-        while True:
-            lease = store.get_lease("controller")
-            if not lease_is_live(lease, now=datetime.now(timezone.utc)):
-                print(json.dumps({"status": "released", "lease": lease}, default=str, sort_keys=True))
-                return 0
-            if time.monotonic() >= deadline:
-                print(
-                    json.dumps({"status": "timeout", "lease": lease}, default=str, sort_keys=True),
-                    file=sys.stderr,
-                )
-                return 1
-            time.sleep(args.poll_seconds)
+        try:
+            while True:
+                lease = store.get_lease("controller")
+                if not lease_is_live(lease, now=datetime.now(timezone.utc)):
+                    print(json.dumps({"status": "released", "lease": lease}, default=str, sort_keys=True))
+                    return 0
+                if time.monotonic() >= deadline:
+                    print(
+                        json.dumps({"status": "timeout", "lease": lease}, default=str, sort_keys=True),
+                        file=sys.stderr,
+                    )
+                    return 1
+                time.sleep(args.poll_seconds)
+        finally:
+            store.close()
     if args.command == "set-controller-epoch":
         from .runtime import FirestoreStateStore
 
@@ -478,7 +490,10 @@ def main(argv: list[str] | None = None) -> int:
             collection_prefix=fleet.name.replace("-", "_"),
             project=fleet.project,
         )
-        store.set_lease_epoch("controller", args.epoch)
+        try:
+            store.set_lease_epoch("controller", args.epoch)
+        finally:
+            store.close()
         print(json.dumps({"status": "updated", "epoch": args.epoch}))
         return 0
     raise AssertionError(args.command)
@@ -506,18 +521,19 @@ def materialize_path(path: str) -> Path:
 
 
 def bootstrap_ready(deployment_path: Path, startup_path: Path) -> int:
-    from .gcp import SubprocessGCPClient, resource_matches_entry
+    from .gcp import ConcurrentInventoryGCPClient, resource_matches_entry
 
     fleet = load_fleet_spec(deployment_path)
     ssh_transport = "direct" if fleet.ssh_transport == "direct" else "iap"
     payload = base64.b64encode(startup_path.read_bytes()).decode()
     remote_command = f"printf %s {shlex.quote(payload)} | base64 -d | sudo bash"
+    tpus, _ = ConcurrentInventoryGCPClient(fleet=fleet).list_inventory(
+        project=fleet.project
+    )
     ready_tpus = sorted(
         (
             tpu
-            for tpu in SubprocessGCPClient(fleet=fleet).list_tpus(
-                project=fleet.project
-            )
+            for tpu in tpus
             if tpu.ready_for_ssh(ssh_transport)
             and any(resource_matches_entry(tpu, entry) for entry in fleet.tpus)
         ),
@@ -566,15 +582,19 @@ def google_authorized_session(project: str, *, scopes: tuple[str, ...]):
 
 def probe_adopted_device_owners(resource_id: str) -> int:
     from .distributed import DistributedTPURunner
+    from .runtime import FirestoreStateStore
 
     fleet, project, store = runner_context()
-    resource = store.get_resource(resource_id)
-    if resource is None:
-        raise ValueError(f"resource not found: {resource_id!r}")
-    if not resource.adopted:
-        raise ValueError(f"resource {resource_id!r} is not adopted")
-    if resource.status != "idle" or resource.current_job_id or resource.current_attempt_id:
-        raise ValueError(f"resource {resource_id!r} is not exactly idle and unassigned")
+    try:
+        resource = store.get_resource(resource_id)
+        if resource is None:
+            raise ValueError(f"resource not found: {resource_id!r}")
+        if not resource.adopted:
+            raise ValueError(f"resource {resource_id!r} is not adopted")
+        if resource.status != "idle" or resource.current_job_id or resource.current_attempt_id:
+            raise ValueError(f"resource {resource_id!r} is not exactly idle and unassigned")
+    finally:
+        store.close()
     workers = DistributedTPURunner(
         name=fleet.name,
         project=project,
@@ -591,13 +611,21 @@ def probe_adopted_device_owners(resource_id: str) -> int:
         "workers": workers,
         "observed_at": datetime.now(timezone.utc).isoformat(),
     }
-    store.record_event("adopted_tpu_device_owner_probe", payload)
+    event_store = FirestoreStateStore(
+        project=project,
+        collection_prefix=fleet.name.replace("-", "_"),
+    )
+    try:
+        event_store.record_event("adopted_tpu_device_owner_probe", payload)
+    finally:
+        event_store.close()
     print(json.dumps(payload, sort_keys=True))
     return 0 if clear else 75
 
 
 def fleet_status(deployment_path: Path) -> dict:
-    """Read durable runner state without mutating the fleet or queue."""
+    """Read active runner state without loading terminal job history."""
+    from .controller import resource_is_inventory_owned_for_fleet
     from .runtime import FirestoreStateStore
 
     fleet = load_fleet_spec(materialize_path(str(deployment_path)))
@@ -605,12 +633,32 @@ def fleet_status(deployment_path: Path) -> dict:
         project=fleet.project,
         collection_prefix=fleet.name.replace("-", "_"),
     )
+    try:
+        jobs = store.list_jobs_with_statuses({"pending", "running", "cancelling"})
+        attempts = [
+            attempt
+            for job in jobs
+            if job.current_attempt_id
+            for attempt in store.list_attempts_for_job(job.spec.id)
+        ]
+        resources = [
+            resource
+            for resource in store.list_resources_excluding_statuses(
+                {"deleted", "preempted"}
+            )
+            if resource_is_inventory_owned_for_fleet(resource, fleet)
+        ]
+        interruption_requests = store.list_interruption_requests_with_statuses(
+            {"requested", "processing"}
+        )
+    finally:
+        store.close()
     return build_status_payload(
         fleet=fleet,
-        jobs=store.list_jobs(),
-        attempts=store.list_attempts(),
-        resources=store.list_resources(),
-        interruption_requests=store.list_interruption_requests(),
+        jobs=jobs,
+        attempts=attempts,
+        resources=resources,
+        interruption_requests=interruption_requests,
     )
 
 
@@ -908,23 +956,24 @@ def submit_jobs(path: Path, *, job_ids: Sequence[str] | None = None) -> int:
         )
         submitted_at = datetime.now(timezone.utc).isoformat()
         record = JobRecord(spec=spec, submitted_at=submitted_at)
-        spec_path = Path(tempfile.mkdtemp(prefix="tpu-runner-job-")) / "spec.json"
-        spec_path.write_text(
-            json.dumps(
-                {
-                    "submitted_at": submitted_at,
-                    "job": job_record_to_dict(record),
-                },
-                indent=2,
-                sort_keys=True,
-            )
-        )
         spec_uris = tuple(
             f"{bucket}/jobs/{spec.id}/spec-{submission_token}.json"
             for _, bucket in spec.bucket_regions
         )
-        for spec_uri in spec_uris:
-            artifacts.upload(spec_path, spec_uri)
+        with tempfile.TemporaryDirectory(prefix="tpu-runner-job-") as directory:
+            spec_path = Path(directory) / "spec.json"
+            spec_path.write_text(
+                json.dumps(
+                    {
+                        "submitted_at": submitted_at,
+                        "job": job_record_to_dict(record),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            for spec_uri in spec_uris:
+                artifacts.upload(spec_path, spec_uri)
         prepared.append((record, spec_uris))
 
     from .runtime import FirestoreStateStore
@@ -998,6 +1047,7 @@ def publish_regional_bundles(
             raise ValueError("multi-region jobs require a local source bundle")
         return ((bucket_regions[0][0], bundle),)
     source = (base_dir / bundle).resolve()
+    temporary_archive = source.is_dir()
     if source.is_dir():
         archive, digest = create_content_bundle(source)
     elif source.is_file() and tarfile.is_tarfile(source):
@@ -1005,20 +1055,15 @@ def publish_regional_bundles(
         digest = sha256_file(source)
     else:
         raise ValueError(f"bundle must be a directory, tar archive, or GCS URI: {source}")
-    regional_bundles: list[tuple[str, str]] = []
-    for region, bucket in bucket_regions:
-        uri = f"{bucket}/bundles/{digest}.tar.gz"
-        exists = subprocess.run(
-            ["gcloud", "storage", "ls", uri, f"--project={project}"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        ).returncode == 0
-        if not exists:
+    try:
+        regional_bundles: list[tuple[str, str]] = []
+        for region, bucket in bucket_regions:
+            uri = f"{bucket}/bundles/{digest}.tar.gz"
             command = [
                 "gcloud",
                 "storage",
                 "cp",
+                "--no-clobber",
                 str(archive),
                 uri,
                 f"--project={project}",
@@ -1037,8 +1082,12 @@ def publish_regional_bundles(
                     output=result.stdout,
                     stderr=result.stderr,
                 )
-        regional_bundles.append((region, uri))
-    return tuple(regional_bundles)
+            regional_bundles.append((region, uri))
+        return tuple(regional_bundles)
+    finally:
+        if temporary_archive:
+            archive.unlink(missing_ok=True)
+            archive.parent.rmdir()
 
 
 def create_content_bundle(root: Path) -> tuple[Path, str]:
@@ -1184,26 +1233,29 @@ def cancel_jobs(job_ids: Sequence[str], *, if_pending: bool = False) -> int:
     fleet, _, store = runner_context()
     exit_code = 0
     changed = False
-    for job_id in job_ids:
-        status = (
-            store.cancel_job(job_id, if_pending=True)
-            if if_pending
-            else store.cancel_job(job_id)
-        )
-        if status is None:
-            result = {"job_id": job_id, "status": "unknown"}
-            exit_code = max(exit_code, 1)
-        elif status == "conflict":
-            result = {
-                "job_id": job_id,
-                "status": "conflict",
-                "reason": "job is no longer unassigned and pending",
-            }
-            exit_code = 2
-        else:
-            result = {"job_id": job_id, "status": status}
-            changed = changed or status in {"cancelling", "deactivated"}
-        print(json.dumps(result, sort_keys=True))
+    try:
+        for job_id in job_ids:
+            status = (
+                store.cancel_job(job_id, if_pending=True)
+                if if_pending
+                else store.cancel_job(job_id)
+            )
+            if status is None:
+                result = {"job_id": job_id, "status": "unknown"}
+                exit_code = max(exit_code, 1)
+            elif status == "conflict":
+                result = {
+                    "job_id": job_id,
+                    "status": "conflict",
+                    "reason": "job is no longer unassigned and pending",
+                }
+                exit_code = 2
+            else:
+                result = {"job_id": job_id, "status": status}
+                changed = changed or status in {"cancelling", "deactivated"}
+            print(json.dumps(result, sort_keys=True))
+    finally:
+        store.close()
     if changed:
         trigger_controller(fleet)
     return exit_code
@@ -1217,10 +1269,13 @@ def set_job_priority(
     """Atomically reprioritize exactly one pending, unassigned job."""
 
     fleet, _, store = runner_context()
-    status = store.reprioritize_pending_job(
-        job_id,
-        priority=priority,
-    )
+    try:
+        status = store.reprioritize_pending_job(
+            job_id,
+            priority=priority,
+        )
+    finally:
+        store.close()
     if status is None:
         result = {"job_id": job_id, "status": "unknown"}
         exit_code = 1
@@ -1254,15 +1309,18 @@ def request_controlled_interruption(
         if not entry.adopted and entry.provisioning_model == "spot"
     }
     try:
-        request = store.create_interruption_request(
-            resource_id=resource_id,
-            job_id=job_id,
-            attempt_id=attempt_id,
-            eligible_fleet_entry_ids=eligible_fleet_entry_ids,
-        )
-    except (KeyError, ValueError) as exc:
-        print(f"interruption request rejected: {exc}", file=os.sys.stderr)
-        return 1
+        try:
+            request = store.create_interruption_request(
+                resource_id=resource_id,
+                job_id=job_id,
+                attempt_id=attempt_id,
+                eligible_fleet_entry_ids=eligible_fleet_entry_ids,
+            )
+        except (KeyError, ValueError) as exc:
+            print(f"interruption request rejected: {exc}", file=os.sys.stderr)
+            return 1
+    finally:
+        store.close()
     print(
         json.dumps(
             {
@@ -1424,11 +1482,14 @@ def watch_job(job_id: str) -> int:
 
 def show_logs(job_id: str) -> int:
     fleet, project, store = runner_context()
-    job = store.get_job(job_id)
+    try:
+        job = store.get_job(job_id)
+        attempts = store.list_attempts_for_job(job_id) if job is not None else []
+    finally:
+        store.close()
     if job is None:
         print(f"unknown job: {job_id}", file=os.sys.stderr)
         return 1
-    attempts = [attempt for attempt in store.list_attempts() if attempt.job_id == job_id]
     found = False
     errors: list[str] = []
     for attempt in attempts:
