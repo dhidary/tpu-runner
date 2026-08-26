@@ -120,6 +120,7 @@ class FleetSpec:
     controller_memory: str = "1Gi"
     controller_max_retries: int = 3
     ssh_transport: str = "direct"
+    idle_timeout_seconds: int = 600
 
 @dataclass(frozen=True)
 class CacheSpec:
@@ -271,6 +272,7 @@ def fleet_spec_from_dict(data: dict[str, Any]) -> FleetSpec:
         "bucket",
         "controller_memory",
         "controller_max_retries",
+        "idle_timeout_seconds",
         "ssh_transport",
         "worker_secrets",
     }
@@ -309,6 +311,13 @@ def fleet_spec_from_dict(data: dict[str, Any]) -> FleetSpec:
     ssh_transport = str(data.get("ssh_transport", "direct")).strip().lower()
     if ssh_transport not in {"iap", "direct"}:
         raise ValueError("ssh_transport must be 'iap' or 'direct'")
+    idle_timeout_seconds_raw = data.get("idle_timeout_seconds", 600)
+    if (
+        isinstance(idle_timeout_seconds_raw, bool)
+        or not isinstance(idle_timeout_seconds_raw, int)
+        or idle_timeout_seconds_raw < 0
+    ):
+        raise ValueError("idle_timeout_seconds must be a non-negative integer")
 
     entries: list[TPUEntry] = []
     used_ids: set[str] = set()
@@ -417,6 +426,7 @@ def fleet_spec_from_dict(data: dict[str, Any]) -> FleetSpec:
         controller_memory=controller_memory,
         controller_max_retries=controller_max_retries_raw,
         ssh_transport=ssh_transport,
+        idle_timeout_seconds=idle_timeout_seconds_raw,
     )
 
 

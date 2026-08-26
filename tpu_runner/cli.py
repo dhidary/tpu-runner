@@ -777,6 +777,7 @@ def build_status_payload(
         "fleet": {
             "name": fleet.name,
             "project": fleet.project,
+            "idle_timeout_seconds": fleet.idle_timeout_seconds,
             "entries": fleet_entries,
         },
         "jobs": {"counts": counts(job_items), "items": job_items},

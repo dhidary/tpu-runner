@@ -25,6 +25,7 @@ from .runtime import (
     InterruptionRequestRecord,
     JobRecord,
     ResourceRecord,
+    parse_datetime,
     validate_interruption_target,
 )
 from .specs import FleetSpec, region_from_zone, tpu_family_and_chips
@@ -925,6 +926,7 @@ class Controller:
             # so they neither consume quota nor receive new work. A busy
             # ordinal remains untouched until its attempt completes.
             stage_cleanup_tpus = matching_tpus if desired_count else []
+            retained_idle_node_ids: set[str] = set()
             for tpu in stage_cleanup_tpus:
                 if tpu.name in desired_node_ids:
                     continue
@@ -932,6 +934,9 @@ class Controller:
                     tpu, entry.id, adopted=False
                 )
                 if resource_is_busy(resource):
+                    continue
+                if not self.managed_idle_timeout_elapsed(resource):
+                    retained_idle_node_ids.add(tpu.name)
                     continue
                 self.gcp.delete_tpu_vm(
                     name=tpu.name,
@@ -955,6 +960,7 @@ class Controller:
                 if (
                     not resource_matches_entry(qr, entry)
                     or (qr.name, qr.node_id) in desired_pairs
+                    or qr.node_id in retained_idle_node_ids
                     or qr.deleting
                 ):
                     continue
@@ -983,6 +989,8 @@ class Controller:
                         tpu, entry.id, adopted=False
                     )
                     if resource_is_busy(resource):
+                        continue
+                    if not self.managed_idle_timeout_elapsed(resource):
                         continue
                     self.gcp.delete_tpu_vm(
                         name=tpu.name,
@@ -1167,6 +1175,18 @@ class Controller:
                 used_node_ids.add(node_id)
                 quota_remaining[key] -= chips_per_tpu
                 created += 1
+
+    def managed_idle_timeout_elapsed(self, resource: ResourceRecord) -> bool:
+        timeout = self.fleet.idle_timeout_seconds
+        if timeout == 0:
+            return True
+        now = datetime.now(timezone.utc)
+        idle_since = parse_datetime(resource.idle_since)
+        if idle_since is not None:
+            return (now - idle_since).total_seconds() >= timeout
+        resource.idle_since = now.isoformat()
+        self.store.upsert_resource(resource)
+        return False
 
     def managed_capacity_exists(self) -> bool:
         managed_entries = [entry for entry in self.fleet.tpus if not entry.adopted]

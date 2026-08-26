@@ -5,6 +5,8 @@ controller_timeout: 168h
 controller_memory: 1Gi
 controller_max_retries: 3
 ssh_transport: direct
+# Keep managed TPU VMs available for this long after their final job.
+idle_timeout_seconds: 600
 firestore_location: nam5
 network: default
 subnetwork: default
