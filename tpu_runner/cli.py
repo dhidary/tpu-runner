@@ -759,7 +759,7 @@ def build_status_payload(
                 "desired_count": (
                     1 if entry.adopted else desired_counts.get(entry.id, 0)
                 ),
-                "keep_warm": entry.keep_warm,
+                "keep_warm_count": entry.keep_warm_count,
                 "declared": declared,
             }
         )

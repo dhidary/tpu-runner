@@ -98,7 +98,7 @@ class TPUEntry:
     provisioning_model: str = "spot"
     chip_limit: int = 0
     runner_name: str = ""
-    keep_warm: bool = False
+    keep_warm_count: int = 0
 
     @property
     def adopted(self) -> bool:
@@ -335,7 +335,7 @@ def fleet_spec_from_dict(data: dict[str, Any]) -> FleetSpec:
             "runtime",
             "provisioning_model",
             "chip_limit",
-            "keep_warm",
+            "keep_warm_count",
         }
         unknown = sorted(set(raw) - allowed_entry_fields)
         if unknown:
@@ -358,13 +358,16 @@ def fleet_spec_from_dict(data: dict[str, Any]) -> FleetSpec:
         if chip_limit <= 0:
             raise ValueError("each TPU entry requires chip_limit > 0")
         existing = raw.get("existing")
-        keep_warm_raw = raw.get("keep_warm", False)
-        if not isinstance(keep_warm_raw, bool):
-            raise ValueError("TPU entry 'keep_warm' must be a boolean")
-        keep_warm = bool(keep_warm_raw)
+        keep_warm_count = raw.get("keep_warm_count", 0)
+        if isinstance(keep_warm_count, bool) or not isinstance(
+            keep_warm_count, int
+        ):
+            raise ValueError("TPU entry 'keep_warm_count' must be an integer")
+        if keep_warm_count < 0:
+            raise ValueError("TPU entry 'keep_warm_count' must be >= 0")
         if existing:
-            if keep_warm:
-                raise ValueError("adopted TPU entries cannot set keep_warm")
+            if keep_warm_count:
+                raise ValueError("adopted TPU entries cannot set keep_warm_count")
             count = 0
         else:
             if "count" not in raw:
@@ -376,6 +379,8 @@ def fleet_spec_from_dict(data: dict[str, Any]) -> FleetSpec:
                 raise ValueError("created TPU entries with count > 0 require 'runtime'")
             if provisioning_model != "spot":
                 raise ValueError("created TPU entries currently support only spot capacity")
+            if keep_warm_count > count:
+                raise ValueError("TPU entry 'keep_warm_count' cannot exceed count")
 
         quota_key = (provisioning_model, family, str(raw["zone"]))
         if quota_key in limits and limits[quota_key] != chip_limit:
@@ -399,7 +404,7 @@ def fleet_spec_from_dict(data: dict[str, Any]) -> FleetSpec:
                 provisioning_model=provisioning_model,
                 chip_limit=chip_limit,
                 runner_name=name,
-                keep_warm=keep_warm,
+                keep_warm_count=keep_warm_count,
             )
         )
 

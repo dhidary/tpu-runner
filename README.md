@@ -36,7 +36,7 @@ Create an example deployment:
 tpu-runner init
 ```
 
-Edit `deployment.yaml` with your project ID, existing Secret Manager secret names, and the TPU types, zones, maximum counts, runtime versions, and chip limits you are willing to use. Counts are provisioning ceilings and TPU Runner scales capacity with demand. Managed TPUs remain available for `idle_timeout_seconds` after their final job (600 seconds by default); `keep_warm` retains the first TPU in an entry indefinitely.
+Edit `deployment.yaml` with your project ID, existing Secret Manager secret names, and the TPU types, zones, maximum counts, runtime versions, and chip limits you are willing to use. Counts are provisioning ceilings and TPU Runner scales capacity with demand. Managed TPUs remain available for `idle_timeout_seconds` after their final job (600 seconds by default); `keep_warm_count` retains that many TPUs in a Spot pool indefinitely.
 
 The default `ssh_transport: direct` creates public-IP TPUs; set it to `iap` to create private-IP TPUs and reach them through IAP tunnels instead.
 

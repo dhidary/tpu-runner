@@ -13,7 +13,8 @@ subnetwork: default
 # Existing Secret Manager secret names; jobs fetch their values at runtime.
 worker_secrets: []
 
-# count caps TPU VMs; chip_limit caps physical chips per model, family, and zone.
+# count caps TPU VMs; keep_warm_count retains that many indefinitely.
+# chip_limit caps physical chips per model, family, and zone.
 tpus:
   # Replace this with an existing 32-chip v4 TPU, or remove this entry.
   - id: us-central2b-v4-ondemand
@@ -28,6 +29,7 @@ tpus:
     zone: us-central2-b
     runtime: tpu-ubuntu2204-base
     count: 1
+    keep_warm_count: 0
     chip_limit: 32
 
   - id: us-east1d-v6e-spot

@@ -154,12 +154,18 @@ writes. Do not move ownership transitions out of their existing transactions.
 ## Capacity and scheduling policy
 
 Managed entry `count` is a hard ceiling, not a standing request. Desired count
-is busy resources plus pending demand, capped by the entry count, with ordinal
-one retained when `keep_warm` is true. Chip limits are enforced again before
-creation using all reserved TPU/queued-resource chips for the same model,
-family, and zone. This is a runner-side ceiling, not GCP quota discovery or a
-quota request. TPU v4 accelerator names count TensorCores, so validation and
-capacity accounting divide the v4 type suffix by two to obtain physical chips.
+is busy resources plus pending demand, capped by the entry count, with at least
+`keep_warm_count` TPUs retained in each managed entry. Chip limits are enforced
+again before creation using all reserved TPU/queued-resource chips for the same
+model, family, and zone. This is a runner-side ceiling, not GCP quota discovery
+or a quota request. TPU v4 accelerator names count TensorCores, so validation
+and capacity accounting divide the v4 type suffix by two to obtain physical
+chips.
+
+Managed TPUs record `idle_since` when an attempt releases them or when newly
+ready capacity first becomes idle. Inventory refreshes must preserve that
+timestamp. Undesired capacity is deleted after `idle_timeout_seconds`;
+`keep_warm_count` is an indefinite floor that overrides idle scale-down.
 
 Adopted idle capacity is matched before managed demand. Compatible unpinned
 jobs may use it automatically; `tpu_name` remains an exact resource pin.

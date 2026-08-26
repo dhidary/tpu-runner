@@ -594,7 +594,9 @@ class Controller:
                     adopted=False,
                     status="provisioning",
                 )
-            elif resource.current_attempt_id:
+            elif resource.current_attempt_id or resource.status == "idle":
+                # An ACTIVE queued resource also backs a ready TPU. Preserve
+                # the idle timestamp set when its last attempt finished.
                 continue
             else:
                 resource.zone = entry.zone

@@ -243,6 +243,6 @@ def desired_managed_capacity_counts(
         )
         desired[entry.id] = min(
             entry.count,
-            max(int(entry.keep_warm), busy_count + pending_demand.get(entry.id, 0)),
+            max(entry.keep_warm_count, busy_count + pending_demand.get(entry.id, 0)),
         )
     return desired
