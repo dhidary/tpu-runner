@@ -13,6 +13,7 @@ import sys
 import tarfile
 import tempfile
 import threading
+import textwrap
 import time
 import uuid
 from collections.abc import Mapping, Sequence
@@ -132,12 +133,27 @@ class ControllerLeaseRenewer:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the public CLI with concise errors for expected user failures."""
+
+    try:
+        return _main(argv)
+    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+        print(f"tpu-runner: error: {exc}", file=sys.stderr)
+        return 2
+
+
+def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="tpu-runner",
         description=(
-            "Orchestrate queued jobs across regional, demand-driven Google "
-            "Cloud Spot TPU capacity."
+            "Orchestrate queued jobs across regional Google Cloud TPU capacity, "
+            "including Spot, on-demand, and adopted TPUs."
         ),
+        epilog=(
+            "Run 'tpu-runner COMMAND --help' for command behavior and an example.\n"
+            "State and control events use JSON; logs remain readable text."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--version",
@@ -146,8 +162,35 @@ def main(argv: list[str] | None = None) -> int:
     )
     sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
-    fleet_parser = sub.add_parser(
-        "validate-fleet", help="validate a deployment file without cloud changes"
+    def public_parser(
+        name: str,
+        *,
+        summary: str,
+        description: str,
+        example: str,
+    ) -> argparse.ArgumentParser:
+        return sub.add_parser(
+            name,
+            help=summary,
+            description=textwrap.fill(description),
+            epilog=f"Example:\n  {example}",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
+
+    def internal_parser(name: str, description: str) -> argparse.ArgumentParser:
+        return sub.add_parser(
+            name,
+            description=f"Internal deployment command. {description}",
+        )
+
+    fleet_parser = public_parser(
+        "validate-fleet",
+        summary="validate a deployment file without cloud changes",
+        description=(
+            "Parse and validate the complete fleet configuration, then print its "
+            "normalized bucket and TPU entries. This performs no cloud mutations."
+        ),
+        example="tpu-runner validate-fleet deployment.yaml",
     )
     fleet_parser.add_argument(
         "path",
@@ -156,8 +199,14 @@ def main(argv: list[str] | None = None) -> int:
         help="deployment YAML path (default: deployment.yaml)",
     )
 
-    jobs_parser = sub.add_parser(
-        "validate-jobs", help="validate a job manifest without submitting it"
+    jobs_parser = public_parser(
+        "validate-jobs",
+        summary="validate a job manifest without submitting it",
+        description=(
+            "Parse and validate every job in a manifest and print the normalized "
+            "job specifications. This uploads nothing and creates no queue records."
+        ),
+        example="tpu-runner validate-jobs job.yaml",
     )
     jobs_parser.add_argument(
         "path",
@@ -166,8 +215,14 @@ def main(argv: list[str] | None = None) -> int:
         help="job manifest YAML path (default: job.yaml)",
     )
 
-    init_parser = sub.add_parser(
-        "init", help="write an example deployment file in the current directory"
+    init_parser = public_parser(
+        "init",
+        summary="write an example deployment file in the current directory",
+        description=(
+            "Copy the packaged deployment template to PATH. Existing files are "
+            "never overwritten."
+        ),
+        example="tpu-runner init deployment.yaml",
     )
     init_parser.add_argument(
         "path",
@@ -176,7 +231,17 @@ def main(argv: list[str] | None = None) -> int:
         help="output path (default: deployment.yaml)",
     )
 
-    submit_parser = sub.add_parser("submit", help="submit jobs from a manifest")
+    submit_parser = public_parser(
+        "submit",
+        summary="submit jobs from a manifest",
+        description=(
+            "Validate the selected jobs, archive and upload their local bundles and "
+            "regional specifications, atomically create the queue records, and "
+            "trigger the controller. JSON events include each generated job ID and "
+            "artifact location. Capacity racing never creates duplicate executions."
+        ),
+        example="tpu-runner submit job.yaml --job-id train-1",
+    )
     submit_parser.add_argument(
         "path",
         nargs="?",
@@ -190,13 +255,41 @@ def main(argv: list[str] | None = None) -> int:
         help="submit only this exact manifest job id; may be repeated",
     )
 
-    watch_parser = sub.add_parser("watch", help="watch one job until it is terminal")
+    watch_parser = public_parser(
+        "watch",
+        summary="watch one job until it is terminal",
+        description=(
+            "Poll one job, stream available Cloud Logging output, and emit JSON state, "
+            "assignment, and artifact events until the job succeeds, fails, or is "
+            "deactivated. Assignment events identify the exact TPU and attempt. The "
+            "exit status is zero only when the job succeeds."
+        ),
+        example="tpu-runner watch JOB_ID",
+    )
     watch_parser.add_argument("job_id", help="job ID to watch")
 
-    logs_parser = sub.add_parser("logs", help="show logs for one job")
+    logs_parser = public_parser(
+        "logs",
+        summary="show logs and diagnostics for one job",
+        description=(
+            "Print durable per-worker logs and diagnostics from the job bucket, then "
+            "show recent Cloud Logging entries. This is a read-only snapshot, not a "
+            "continuous follow operation."
+        ),
+        example="tpu-runner logs JOB_ID",
+    )
     logs_parser.add_argument("job_id", help="job ID whose logs should be shown")
 
-    cancel_parser = sub.add_parser("cancel", help="cancel one or more jobs")
+    cancel_parser = public_parser(
+        "cancel",
+        summary="cancel one or more jobs",
+        description=(
+            "Deactivate pending jobs or request exact-attempt cancellation for active "
+            "jobs. One JSON result is printed per job. Use --if-pending when assignment "
+            "must lose rather than race this request; conflicts return a nonzero status."
+        ),
+        example="tpu-runner cancel JOB_ID --if-pending",
+    )
     cancel_parser.add_argument("job_ids", nargs="+", help="job IDs to cancel")
     cancel_parser.add_argument(
         "--if-pending",
@@ -207,9 +300,15 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
 
-    priority_parser = sub.add_parser(
+    priority_parser = public_parser(
         "set-priority",
-        help="atomically reprioritize one pending, unassigned job",
+        summary="atomically reprioritize one pending, unassigned job",
+        description=(
+            "Change queue priority only if the exact job is still pending and "
+            "unassigned. If assignment has started, the command reports a conflict "
+            "without changing the job and returns a nonzero status."
+        ),
+        example="tpu-runner set-priority JOB_ID high",
     )
     priority_parser.add_argument("job_id", help="pending job ID")
     priority_parser.add_argument(
@@ -218,9 +317,18 @@ def main(argv: list[str] | None = None) -> int:
         help="new queue priority",
     )
 
-    interrupt_parser = sub.add_parser(
+    interrupt_parser = public_parser(
         "interrupt-spot",
-        help="request deletion of one exact runner-managed Spot attempt",
+        summary="request deletion of one exact runner-managed Spot attempt",
+        description=(
+            "Request controlled deletion of one exact active attempt on a runner-managed "
+            "Spot TPU. All three identities are revalidated transactionally; adopted and "
+            "on-demand resources are rejected."
+        ),
+        example=(
+            "tpu-runner interrupt-spot RESOURCE_ID --job-id JOB_ID "
+            "--attempt-id ATTEMPT_ID"
+        ),
     )
     interrupt_parser.add_argument("resource_id", help="managed TPU resource ID")
     interrupt_parser.add_argument("--job-id", required=True, help="owning job ID")
@@ -228,16 +336,28 @@ def main(argv: list[str] | None = None) -> int:
         "--attempt-id", required=True, help="active attempt ID"
     )
 
-    probe_parser = sub.add_parser(
+    probe_parser = public_parser(
         "probe-adopted-device-owners",
-        help="read root-visible TPU device owners on every worker without mutation",
+        summary="read TPU device owners on an adopted resource without mutation",
+        description=(
+            "Inspect root-visible TPU device owners on every worker of one adopted TPU. "
+            "The probe is read-only and does not stop processes or change runner state."
+        ),
+        example="tpu-runner probe-adopted-device-owners --resource-id RESOURCE_ID",
     )
     probe_parser.add_argument(
         "--resource-id", required=True, help="adopted TPU resource ID"
     )
 
-    status_parser = sub.add_parser(
-        "status", help="emit read-only active fleet state as JSON"
+    status_parser = public_parser(
+        "status",
+        summary="emit read-only active fleet state as JSON",
+        description=(
+            "Read Firestore and print schema-versioned fleet, job, attempt, resource, "
+            "and interruption-request state. Counts and full item records are included; "
+            "no controller or cloud resource is changed."
+        ),
+        example="tpu-runner status --deployment deployment.yaml --pretty",
     )
     status_parser.add_argument(
         "--deployment",
@@ -248,13 +368,32 @@ def main(argv: list[str] | None = None) -> int:
         "--pretty", action="store_true", help="pretty-print the JSON output"
     )
 
-    sub.add_parser("controller")
-    bootstrap_parser = sub.add_parser("bootstrap-ready")
-    bootstrap_parser.add_argument("--deployment", default=str(DEFAULT_DEPLOYMENT_PATH))
-    bootstrap_parser.add_argument("--startup", required=True)
+    internal_parser(
+        "controller",
+        "Run the Cloud Run reconciliation loop for the deployed fleet.",
+    )
+    bootstrap_parser = internal_parser(
+        "bootstrap-ready",
+        "Wait for the deployed worker startup artifact to become available.",
+    )
+    bootstrap_parser.add_argument(
+        "--deployment",
+        default=str(DEFAULT_DEPLOYMENT_PATH),
+        help="deployment YAML path",
+    )
+    bootstrap_parser.add_argument(
+        "--startup", required=True, help="rendered startup script path"
+    )
 
-    deploy_parser = sub.add_parser(
-        "deploy", help="create or update the declared runner deployment"
+    deploy_parser = public_parser(
+        "deploy",
+        summary="create or update the declared runner deployment",
+        description=(
+            "Validate the deployment, enable required APIs, configure the runner bucket, "
+            "Firestore, service accounts, IAM and SSH identity, build the controller "
+            "image, and roll out and start the Cloud Run controller job."
+        ),
+        example="tpu-runner deploy deployment.yaml",
     )
     deploy_parser.add_argument(
         "path",
@@ -263,18 +402,47 @@ def main(argv: list[str] | None = None) -> int:
         help="deployment YAML path (default: deployment.yaml)",
     )
 
-    lease_parser = sub.add_parser("release-controller-lease")
-    lease_parser.add_argument("--deployment", required=True)
-    lease_parser.add_argument("--owner", required=True)
+    lease_parser = internal_parser(
+        "release-controller-lease",
+        "Release the controller lease only when it is owned by the given execution.",
+    )
+    lease_parser.add_argument(
+        "--deployment", required=True, help="deployment YAML path"
+    )
+    lease_parser.add_argument(
+        "--owner", required=True, help="expected controller lease owner"
+    )
 
-    wait_lease_parser = sub.add_parser("wait-controller-release")
-    wait_lease_parser.add_argument("--deployment", required=True)
-    wait_lease_parser.add_argument("--timeout-seconds", type=int, default=1200)
-    wait_lease_parser.add_argument("--poll-seconds", type=float, default=5.0)
+    wait_lease_parser = internal_parser(
+        "wait-controller-release",
+        "Wait until the previous controller lease is absent or expired.",
+    )
+    wait_lease_parser.add_argument(
+        "--deployment", required=True, help="deployment YAML path"
+    )
+    wait_lease_parser.add_argument(
+        "--timeout-seconds",
+        type=int,
+        default=1200,
+        help="maximum wait in seconds (default: 1200)",
+    )
+    wait_lease_parser.add_argument(
+        "--poll-seconds",
+        type=float,
+        default=5.0,
+        help="poll interval in seconds (default: 5)",
+    )
 
-    epoch_parser = sub.add_parser("set-controller-epoch")
-    epoch_parser.add_argument("--deployment", required=True)
-    epoch_parser.add_argument("--epoch", required=True)
+    epoch_parser = internal_parser(
+        "set-controller-epoch",
+        "Fence older controller deployments with a new exact epoch.",
+    )
+    epoch_parser.add_argument(
+        "--deployment", required=True, help="deployment YAML path"
+    )
+    epoch_parser.add_argument(
+        "--epoch", required=True, help="new controller deployment epoch"
+    )
 
     args = parser.parse_args(argv)
     if args.command == "validate-fleet":

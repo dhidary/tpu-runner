@@ -515,7 +515,10 @@ def job_specs_from_dict(data: dict[str, Any]) -> tuple[JobSpec, ...]:
 def load_yaml_file(path: str | Path) -> dict[str, Any]:
     import yaml
 
-    loaded = yaml.safe_load(Path(path).read_text())
+    try:
+        loaded = yaml.safe_load(Path(path).read_text())
+    except yaml.YAMLError as exc:
+        raise ValueError(f"invalid YAML in {path}: {exc}") from None
     if not isinstance(loaded, dict):
         raise ValueError("YAML document must be a mapping")
     return loaded

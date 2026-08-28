@@ -15,6 +15,8 @@ architecture, invariants, race analysis, and maintainer procedures here.
 - `tpu_runner/specs.py`: immutable fleet/job/cache models and YAML validation.
 - `tpu_runner/placement.py`: resolves regional job buckets and rejects literal
   `gs://` dependencies that would defeat local placement.
+- `tpu_runner/region_pools.py`: normalizes logical placement pools and matches
+  them to exact GCP storage regions.
 - `tpu_runner/capacity_policy.py`: pure scheduling, stable priority, compatibility,
   and desired-capacity policy.
 - `tpu_runner/runtime.py`: Firestore records, serialization, leases, and all
@@ -30,6 +32,21 @@ architecture, invariants, race analysis, and maintainer procedures here.
 - `tpu_runner/deploy.sh`: GCP control-plane provisioning and controller rollout.
 - `tpu_runner/startup.sh`: TPU VM user, SSH, scratch, linger, and readiness setup.
 - `tpu_runner/Dockerfile` and `cloudbuild.yaml`: controller image build.
+
+## CLI contract
+
+Keep `tpu-runner --help` concise and keep internal deployment commands out of
+its public command list. Every public subcommand help page should explain what
+it reads or changes, its important safety semantics, its output, and one useful
+example. Expected input, configuration, and cloud-operation failures should be
+reported as concise errors without Python tracebacks.
+
+`submit`, `watch`, `status`, `cancel`, `set-priority`, and `interrupt-spot`
+emit machine-readable JSON records. Preserve established event and field names
+when changing these commands unless the user explicitly approves an interface
+change. `watch` emits assignment identity and periodic state, follows available
+Cloud Logging output, reports the artifact location at terminal state, returns
+zero only for success, and returns 130 when interrupted locally.
 
 ## Deployment lifecycle
 
@@ -118,6 +135,10 @@ operations make actual cycle time longer. A background renewer refreshes the
 15-minute Firestore lease every 60 seconds while the main thread blocks; normal
 phase heartbeats remain synchronous. Stop and join the renewer before releasing
 the lease so it cannot reacquire after an intentional handoff.
+
+Inventory descriptions run concurrently for speed, but only for exact
+declared/generated names and exact known managed records. Concurrency must not
+weaken the inventory scope or resource identity checks.
 
 ## State and transaction invariants
 
@@ -297,12 +318,12 @@ processes with narrow, verified commands when there is an actionable failure.
 Keep verification proportional and local. Useful release checks:
 
 ```bash
-python -m tpu_runner --version
-python -m tpu_runner --help
-python -m tpu_runner validate-fleet tpu_runner/deployment.example.yaml
+uv run python -m tpu_runner --version
+uv run python -m tpu_runner --help
+uv run python -m tpu_runner validate-fleet tpu_runner/deployment.example.yaml
 bash -n tpu_runner/deploy.sh tpu_runner/startup.sh
-python -m build
-python -m twine check dist/*
+uv run --extra release python -m build
+uv run --extra release python -m twine check dist/*
 ```
 
 Also install the built wheel into a new temporary environment, run
@@ -318,9 +339,10 @@ configuration out of commits unless explicitly requested.
 
 ## Git workflow
 
-Commit and push relevant reusable core changes as work progresses. Keep tests,
-temporary artifacts, generated manifests, live campaign configuration, logs,
-and campaign-specific state out of commits unless explicitly requested.
+Commit relevant reusable core changes as work progresses. Push, tag, release,
+or deploy only with explicit user permission. Keep tests, temporary artifacts,
+generated manifests, live campaign configuration, logs, and campaign-specific
+state out of commits unless explicitly requested.
 
 Preserve unrelated user changes. In particular, do not stage or commit the
 automatically added `# Hillclimb hook files` block in `.gitignore` unless the
