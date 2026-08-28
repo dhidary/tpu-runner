@@ -206,10 +206,15 @@ def desired_managed_capacity_counts(
 ) -> dict[str, int]:
     """Return busy plus raced pending demand, capped by physical ceilings."""
 
+    declared_adopted = {
+        (entry.id, entry.existing) for entry in fleet.tpus if entry.adopted
+    }
     idle_adopted = [
         resource
         for resource in resources
-        if resource.adopted and resource.status == "idle"
+        if resource.adopted
+        and resource.status == "idle"
+        and (resource.fleet_entry_id, resource.tpu_name) in declared_adopted
     ]
     adopted_job_ids = {
         job.spec.id
