@@ -108,9 +108,6 @@ jobs to alternative idle TPUs when that allows more jobs to run.
 TPU Runner stores job bundles, logs, diagnostics, status, and checkpoints in the job’s GCS bucket, 
 while your application data remains in the GCS buckets you provide.
 
-Use `tpu-runner --help` for the command overview. Every public command also
-explains its behavior, safety semantics, output, and an example—for instance,
-`tpu-runner submit --help` or `tpu-runner status --help`. State and control
-events use machine-readable JSON, while job logs remain readable text.
+Use `tpu-runner --help` to see all commands and `tpu-runner COMMAND --help` for command-specific guidance.
 
 PRs and feature requests are welcome. Thank you to the [Google TPU Research Cloud (TRC) program](https://sites.research.google/trc/) for inspiring this work.
