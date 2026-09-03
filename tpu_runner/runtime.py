@@ -88,6 +88,8 @@ class ResourceRecord:
     current_attempt_id: str | None = None
     worker_count: int = 1
     idle_since: str = ""
+    provisioning_node_seen_at: str = ""
+    provisioning_node_missing_since: str = ""
     retryable_infrastructure_failures: int = 0
     retryable_infrastructure_job_id: str = ""
     cancellation_failures: int = 0

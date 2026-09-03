@@ -32,6 +32,7 @@ from .specs import FleetSpec, region_from_zone, tpu_family_and_chips
 
 CANCELLATION_RECYCLE_THRESHOLD = 2
 MANAGED_SPOT_LAUNCH_ACCESS_TIMEOUT_SECONDS = 30 * 60
+ORPHANED_PROVISIONING_NODE_GRACE_SECONDS = 300
 
 
 def reset_cancellation_tracking(resource: ResourceRecord) -> None:
@@ -720,6 +721,13 @@ class Controller:
                 and declared
                 and resource.status != "draining"
             ):
+                if (
+                    resource.provisioning_node_seen_at
+                    or resource.provisioning_node_missing_since
+                ):
+                    resource.provisioning_node_seen_at = ""
+                    resource.provisioning_node_missing_since = ""
+                    self.store.upsert_resource(resource)
                 continue
             if not declared:
                 tpu = None
@@ -742,6 +750,43 @@ class Controller:
                 if resource.current_attempt_id:
                     self.mark_tpu_preempted(resource.id)
                     resource = self.store.get_resource(resource.id) or resource
+                if resource.status == "draining":
+                    continue
+                if (
+                    queued_resource.state.upper() == "PROVISIONING"
+                    and resource.provisioning_node_seen_at
+                ):
+                    now = datetime.now(timezone.utc)
+                    missing_since = parse_datetime(
+                        resource.provisioning_node_missing_since
+                    )
+                    if missing_since is None:
+                        resource.provisioning_node_missing_since = now.isoformat()
+                    elif (
+                        now - missing_since
+                    ).total_seconds() >= ORPHANED_PROVISIONING_NODE_GRACE_SECONDS:
+                        self.gcp.delete_queued_resource(
+                            name=queued_resource.name,
+                            zone=queued_resource.zone,
+                            project=self.fleet.project,
+                        )
+                        resource.status = "draining"
+                        resource.provisioning_node_seen_at = ""
+                        resource.provisioning_node_missing_since = ""
+                        self.store.upsert_resource(resource)
+                        self.store.record_event(
+                            "orphaned_provisioning_tpu_recycling",
+                            {
+                                "resource_id": resource.id,
+                                "queued_resource": queued_resource.name,
+                                "zone": queued_resource.zone,
+                                "missing_since": missing_since.isoformat(),
+                                "grace_seconds": (
+                                    ORPHANED_PROVISIONING_NODE_GRACE_SECONDS
+                                ),
+                            },
+                        )
+                        continue
                 if not resource.current_attempt_id:
                     resource.status = "provisioning"
                     resource.current_job_id = None
@@ -762,6 +807,11 @@ class Controller:
                 resource.status = "provisioning"
                 resource.current_job_id = None
                 resource.idle_since = ""
+                if not resource.provisioning_node_seen_at:
+                    resource.provisioning_node_seen_at = datetime.now(
+                        timezone.utc
+                    ).isoformat()
+                resource.provisioning_node_missing_since = ""
                 self.store.upsert_resource(resource)
                 continue
             if tpu:
@@ -1171,6 +1221,8 @@ class Controller:
                 resource.current_job_id = None
                 resource.current_attempt_id = None
                 resource.idle_since = ""
+                resource.provisioning_node_seen_at = ""
+                resource.provisioning_node_missing_since = ""
                 self.store.upsert_resource(resource)
                 stored_resources[node_id] = resource
                 used_queued_resource_names.add(queued_name)
