@@ -35,6 +35,32 @@ MANAGED_SPOT_LAUNCH_ACCESS_TIMEOUT_SECONDS = 30 * 60
 ORPHANED_PROVISIONING_NODE_GRACE_SECONDS = 300
 
 
+def vanished_managed_spot_during_setup(
+    error_summary: str,
+    *,
+    resource: ResourceRecord,
+    fleet: FleetSpec,
+) -> bool:
+    """Return whether setup lost its exact declared managed Spot TPU."""
+    entry = next(
+        (
+            candidate
+            for candidate in fleet.tpus
+            if candidate.id == resource.fleet_entry_id
+        ),
+        None,
+    )
+    return bool(
+        "NOT_FOUND" in error_summary
+        and resource.tpu_name in error_summary
+        and entry is not None
+        and entry.provisioning_model == "spot"
+        and not entry.adopted
+        and not resource.adopted
+        and resource_is_declared_for_fleet(resource, fleet)
+    )
+
+
 def reset_cancellation_tracking(resource: ResourceRecord) -> None:
     resource.cancellation_failures = 0
     resource.cancellation_job_id = ""
@@ -1339,11 +1365,27 @@ class Controller:
                         except TemporaryAccessError:
                             raise
                         except Exception as exc:
-                            self.mark_attempt_command_failed(
-                                attempt.id,
-                                exit_code=2,
-                                error_summary=f"failed_setup: {str(exc)[-4000:]}",
-                            )
+                            error_summary = str(exc)[-4000:]
+                            if vanished_managed_spot_during_setup(
+                                error_summary,
+                                resource=resource,
+                                fleet=self.fleet,
+                            ):
+                                self.mark_attempt_retryable_infrastructure(
+                                    attempt.id,
+                                    exit_code=75,
+                                    error_summary=(
+                                        "managed Spot TPU vanished during setup: "
+                                        + error_summary
+                                    ),
+                                    recycle_immediately=True,
+                                )
+                            else:
+                                self.mark_attempt_command_failed(
+                                    attempt.id,
+                                    exit_code=2,
+                                    error_summary=f"failed_setup: {error_summary}",
+                                )
                             continue
                     attempt.status = "running"
                     if not attempt.started_at:

@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from tpu_runner.controller import (
     ORPHANED_PROVISIONING_NODE_GRACE_SECONDS,
     Controller,
+    vanished_managed_spot_during_setup,
 )
 from tpu_runner.gcp import QueuedResource, TPUVM, generated_resource_names
 from tpu_runner.runtime import AttemptRecord, ResourceRecord
@@ -50,6 +51,53 @@ class RecordingGCP:
 
 
 class RetryableInfrastructureControllerTests(unittest.TestCase):
+    def test_vanished_declared_managed_spot_is_retryable_setup_failure(self) -> None:
+        entry = TPUEntry(
+            id="us-east1d-v6e-spot",
+            type="v6e-16",
+            zone="us-east1-d",
+            count=1,
+            runtime="v6e-ubuntu-2404",
+            provisioning_model="spot",
+            chip_limit=16,
+            runner_name="runner",
+        )
+        _, tpu_name = generated_resource_names(entry, 1)
+        resource = ResourceRecord(
+            id=tpu_name,
+            tpu_name=tpu_name,
+            zone=entry.zone,
+            tpu_type=entry.type,
+            fleet_entry_id=entry.id,
+        )
+        fleet = FleetSpec(
+            name="runner",
+            project="project",
+            bucket="gs://runner",
+            controller_region="us-central1",
+            controller_timeout="1h",
+            firestore_location="nam5",
+            network="default",
+            subnetwork="default",
+            worker_secrets=(),
+            tpus=(entry,),
+        )
+
+        self.assertTrue(
+            vanished_managed_spot_during_setup(
+                f"NOT_FOUND: Resource projects/project/locations/us-east1-d/nodes/{tpu_name} was not found",
+                resource=resource,
+                fleet=fleet,
+            )
+        )
+        self.assertFalse(
+            vanished_managed_spot_during_setup(
+                "NOT_FOUND: some unrelated dependency",
+                resource=resource,
+                fleet=fleet,
+            )
+        )
+
     def test_exact_slice_failure_requeues_and_schedules_immediate_recycle(self) -> None:
         entry = TPUEntry(
             id="us-east1d-v6e-spot",
