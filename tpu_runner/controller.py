@@ -1340,6 +1340,7 @@ class Controller:
                                     attempt.id,
                                     exit_code=result.exit_code or 75,
                                     error_summary=result.error_summary or result.failure_kind,
+                                    recycle_immediately=result.recycle_resource,
                                 )
                             else:
                                 self.mark_attempt_command_failed(
@@ -1425,7 +1426,12 @@ class Controller:
         )
 
     def mark_attempt_retryable_infrastructure(
-        self, attempt_id: str, *, exit_code: int, error_summary: str
+        self,
+        attempt_id: str,
+        *,
+        exit_code: int,
+        error_summary: str,
+        recycle_immediately: bool = False,
     ) -> None:
         attempt_before = self.store.get_attempt(attempt_id)
         resource = None
@@ -1442,7 +1448,7 @@ class Controller:
                 None,
             )
         recycle_threshold = (
-            2
+            (1 if recycle_immediately else 2)
             if resource is not None
             and entry is not None
             and not resource.adopted

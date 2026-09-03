@@ -8,13 +8,16 @@ import shlex
 import signal
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
-from .runtime import AttemptRecord, ResourceRecord, checkpoint_dir, job_bucket
+from .runtime import AttemptRecord, ResourceRecord, checkpoint_dir, job_bucket, parse_datetime
 from .specs import CacheSpec, JobSpec
 
 RETRYABLE_INFRASTRUCTURE_EXIT_CODE = 75
 RETRYABLE_INFRASTRUCTURE_FALLOUT_EXIT_CODES = frozenset({0, 1, 75, 143})
+PARTIAL_FAILURE_STATUS_GRACE_SECONDS = 60
+SLICE_FAILURE_CHIP_DRIVER_ERROR = "slice_failure_chip_driver_error"
 
 
 def is_retryable_infrastructure_exit_set(exit_codes: set[int]) -> bool:
@@ -61,6 +64,152 @@ class DistributedResult:
     exit_code: int | None = None
     failure_kind: str = ""
     error_summary: str = ""
+    recycle_resource: bool = False
+
+
+def worker_command_exit_code(status: dict) -> int:
+    if status.get("infrastructure_failure") == SLICE_FAILURE_CHIP_DRIVER_ERROR:
+        return RETRYABLE_INFRASTRUCTURE_EXIT_CODE
+    return int(status.get("command_exit_code", status.get("exit_code", 1)))
+
+
+def partial_failure_grace_elapsed(
+    statuses: dict[str, dict],
+    *,
+    now: datetime | None = None,
+) -> bool:
+    finished_at = []
+    for status in statuses.values():
+        if worker_command_exit_code(status) == 0:
+            continue
+        parsed = parse_datetime(str(status.get("finished_at", "")))
+        if parsed is None:
+            return True
+        finished_at.append(parsed)
+    if not finished_at:
+        return False
+    current = now or datetime.now(timezone.utc)
+    return (current - min(finished_at)).total_seconds() >= PARTIAL_FAILURE_STATUS_GRACE_SECONDS
+
+
+def aggregate_worker_statuses(
+    statuses: dict[str, dict],
+    *,
+    expected: int,
+    now: datetime | None = None,
+) -> DistributedResult:
+    expected = max(1, expected)
+    if len(statuses) < expected:
+        partial_artifact_errors = [
+            f"{host}: {status['artifact_upload_error']}"
+            for host, status in statuses.items()
+            if status.get("artifact_upload_error")
+        ]
+        if partial_artifact_errors:
+            return DistributedResult(
+                statuses=statuses,
+                complete=True,
+                exit_code=2,
+                failure_kind="artifact_upload_failed",
+                error_summary=(
+                    "artifact upload failed before all worker statuses arrived: "
+                    + "; ".join(partial_artifact_errors)
+                )[-4000:],
+            )
+        partial_exit_codes = {worker_command_exit_code(status) for status in statuses.values()}
+        recycle_resource = any(
+            status.get("infrastructure_failure") == SLICE_FAILURE_CHIP_DRIVER_ERROR
+            for status in statuses.values()
+        )
+        if is_retryable_infrastructure_exit_set(partial_exit_codes):
+            command_errors = [
+                f"{host}: command exited "
+                f"{status.get('command_exit_code', status.get('exit_code', 1))}"
+                for host, status in statuses.items()
+                if worker_command_exit_code(status) != 0
+            ]
+            command_errors.append(
+                f"{expected - len(statuses)} worker status object(s) missing after exact "
+                "retryable infrastructure exit"
+            )
+            return DistributedResult(
+                statuses=statuses,
+                complete=True,
+                exit_code=RETRYABLE_INFRASTRUCTURE_EXIT_CODE,
+                failure_kind="retryable_infrastructure",
+                error_summary="; ".join(command_errors),
+                recycle_resource=recycle_resource,
+            )
+        if partial_exit_codes and partial_exit_codes != {0}:
+            if not partial_failure_grace_elapsed(statuses, now=now):
+                return DistributedResult(statuses=statuses, complete=False)
+            states = {str(status.get("state", "failed")) for status in statuses.values()}
+            command_errors = [
+                f"{host}: command exited "
+                f"{status.get('command_exit_code', status.get('exit_code', 1))}"
+                for host, status in statuses.items()
+                if worker_command_exit_code(status) != 0
+            ]
+            command_errors.append(
+                f"{expected - len(statuses)} worker status object(s) missing after "
+                "distributed command failure"
+            )
+            return DistributedResult(
+                statuses=statuses,
+                complete=True,
+                exit_code=max(partial_exit_codes),
+                failure_kind="failed_setup" if "failed_setup" in states else "command_failed",
+                error_summary="; ".join(command_errors),
+            )
+        return DistributedResult(statuses=statuses, complete=False)
+
+    exit_code = max(int(status.get("exit_code", 1)) for status in statuses.values())
+    states = {str(status.get("state", "failed")) for status in statuses.values()}
+    artifact_errors = [
+        f"{host}: {status['artifact_upload_error']}"
+        for host, status in statuses.items()
+        if status.get("artifact_upload_error")
+    ]
+    command_errors = [
+        f"{host}: command exited {status.get('command_exit_code', status.get('exit_code', 1))}"
+        for host, status in statuses.items()
+        if worker_command_exit_code(status) != 0
+    ]
+    command_exit_codes = {worker_command_exit_code(status) for status in statuses.values()}
+    recycle_resource = any(
+        status.get("infrastructure_failure") == SLICE_FAILURE_CHIP_DRIVER_ERROR
+        for status in statuses.values()
+    )
+    if artifact_errors:
+        failure_kind = "artifact_upload_failed"
+        details = [f"artifact upload failed: {'; '.join(artifact_errors)}", *command_errors]
+        error_summary = "; ".join(details)[-4000:]
+    elif "failed_setup" in states:
+        failure_kind = "failed_setup"
+        error_summary = "failed_setup: " + "; ".join(command_errors)
+    elif is_retryable_infrastructure_exit_set(command_exit_codes):
+        failure_kind = "retryable_infrastructure"
+        error_summary = "; ".join(command_errors)
+    elif exit_code:
+        failure_kind = "command_failed"
+        error_summary = "; ".join(command_errors)
+    else:
+        failure_kind = ""
+        error_summary = ""
+    return DistributedResult(
+        statuses=statuses,
+        complete=True,
+        exit_code=(
+            RETRYABLE_INFRASTRUCTURE_EXIT_CODE
+            if failure_kind == "retryable_infrastructure"
+            else exit_code
+        ),
+        failure_kind=failure_kind,
+        error_summary=error_summary,
+        recycle_resource=(
+            recycle_resource and failure_kind == "retryable_infrastructure"
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -355,108 +504,9 @@ echo "TPU_RUNNER_DISK_RECOVERY $HOST RECOVERED $free_kb_before $free_kb_after $w
 
     def poll(self, *, job: JobSpec, attempt: AttemptRecord, resource: ResourceRecord) -> DistributedResult:
         statuses = self.read_gcs_statuses(job=job, attempt=attempt)
-        expected = max(1, resource.worker_count)
-        if len(statuses) < expected:
-            partial_artifact_errors = [
-                f"{host}: {status['artifact_upload_error']}"
-                for host, status in statuses.items()
-                if status.get("artifact_upload_error")
-            ]
-            if partial_artifact_errors:
-                return DistributedResult(
-                    statuses=statuses,
-                    complete=True,
-                    exit_code=2,
-                    failure_kind="artifact_upload_failed",
-                    error_summary=(
-                        "artifact upload failed before all worker statuses arrived: "
-                        + "; ".join(partial_artifact_errors)
-                    )[-4000:],
-                )
-            partial_exit_codes = {
-                int(status.get("command_exit_code", status.get("exit_code", 1)))
-                for status in statuses.values()
-            }
-            if is_retryable_infrastructure_exit_set(partial_exit_codes):
-                command_errors = [
-                    f"{host}: command exited "
-                    f"{status.get('command_exit_code', status.get('exit_code', 1))}"
-                    for host, status in statuses.items()
-                    if int(status.get("command_exit_code", status.get("exit_code", 1))) != 0
-                ]
-                command_errors.append(
-                    f"{expected - len(statuses)} worker status object(s) missing after exact "
-                    "retryable infrastructure exit"
-                )
-                return DistributedResult(
-                    statuses=statuses,
-                    complete=True,
-                    exit_code=RETRYABLE_INFRASTRUCTURE_EXIT_CODE,
-                    failure_kind="retryable_infrastructure",
-                    error_summary="; ".join(command_errors),
-                )
-            if partial_exit_codes and partial_exit_codes != {0}:
-                states = {str(status.get("state", "failed")) for status in statuses.values()}
-                command_errors = [
-                    f"{host}: command exited "
-                    f"{status.get('command_exit_code', status.get('exit_code', 1))}"
-                    for host, status in statuses.items()
-                    if int(status.get("command_exit_code", status.get("exit_code", 1))) != 0
-                ]
-                command_errors.append(
-                    f"{expected - len(statuses)} worker status object(s) missing after "
-                    "distributed command failure"
-                )
-                return DistributedResult(
-                    statuses=statuses,
-                    complete=True,
-                    exit_code=max(partial_exit_codes),
-                    failure_kind="failed_setup" if "failed_setup" in states else "command_failed",
-                    error_summary="; ".join(command_errors),
-                )
-            return DistributedResult(statuses=statuses, complete=False)
-        exit_code = max(int(status.get("exit_code", 1)) for status in statuses.values())
-        states = {str(status.get("state", "failed")) for status in statuses.values()}
-        artifact_errors = [
-            f"{host}: {status['artifact_upload_error']}"
-            for host, status in statuses.items()
-            if status.get("artifact_upload_error")
-        ]
-        command_errors = [
-            f"{host}: command exited {status.get('command_exit_code', status.get('exit_code', 1))}"
-            for host, status in statuses.items()
-            if int(status.get("command_exit_code", status.get("exit_code", 1))) != 0
-        ]
-        command_exit_codes = {
-            int(status.get("command_exit_code", status.get("exit_code", 1)))
-            for status in statuses.values()
-        }
-        if artifact_errors:
-            failure_kind = "artifact_upload_failed"
-            details = [f"artifact upload failed: {'; '.join(artifact_errors)}", *command_errors]
-            error_summary = "; ".join(details)[-4000:]
-        elif "failed_setup" in states:
-            failure_kind = "failed_setup"
-            error_summary = "failed_setup: " + "; ".join(command_errors)
-        elif is_retryable_infrastructure_exit_set(command_exit_codes):
-            failure_kind = "retryable_infrastructure"
-            error_summary = "; ".join(command_errors)
-        elif exit_code:
-            failure_kind = "command_failed"
-            error_summary = "; ".join(command_errors)
-        else:
-            failure_kind = ""
-            error_summary = ""
-        return DistributedResult(
-            statuses=statuses,
-            complete=True,
-            exit_code=(
-                RETRYABLE_INFRASTRUCTURE_EXIT_CODE
-                if failure_kind == "retryable_infrastructure"
-                else exit_code
-            ),
-            failure_kind=failure_kind,
-            error_summary=error_summary,
+        return aggregate_worker_statuses(
+            statuses,
+            expected=resource.worker_count,
         )
 
     def read_gcs_statuses(self, *, job: JobSpec, attempt: AttemptRecord) -> dict[str, dict]:
@@ -688,6 +738,7 @@ upload_artifact() {{
   }}
   device_release_deadline=$((SECONDS + DEVICE_RELEASE_TIMEOUT_SECONDS))
   code=0
+  infrastructure_failure=""
   while true; do
     stale_device_owner_pids="$(device_owner_pids)"
     [[ -n "$stale_device_owner_pids" ]] || break
@@ -741,6 +792,13 @@ upload_artifact() {{
     code=$?
     wait "$log_sync_pid" 2>/dev/null || true
   fi
+  if (( code != 0 )) && grep -Fq \
+    "Terminating the libtpu controller process because an anomalous TPUworker process is detected: SLICE_FAILURE_CHIP_DRIVER_ERROR" \
+    "$ATTEMPT_DIR/command-$HOST.log"; then
+    infrastructure_failure="{SLICE_FAILURE_CHIP_DRIVER_ERROR}"
+    echo "[runner] classified exact libtpu SLICE_FAILURE_CHIP_DRIVER_ERROR as retryable infrastructure" \
+      >>"$ATTEMPT_DIR/command-$HOST.log"
+  fi
   printf '%s %s\n' "$ATTEMPT_ID" "$$" >"$PID_FILE"
   finished_at="$(date -Is)"
   state="succeeded"
@@ -752,6 +810,7 @@ upload_artifact() {{
       echo "started_at=$started_at"
       echo "finished_at=$finished_at"
       echo "exit_code=$code"
+      echo "infrastructure_failure=$infrastructure_failure"
       df -h /
       df -h /dev/shm
       free -h || true
@@ -772,7 +831,8 @@ upload_artifact() {{
   fi
   STATUS_HOST="$HOST" STATUS_STATE="$state" STATUS_EXIT_CODE="$final_code" \
     STATUS_COMMAND_EXIT_CODE="$code" STATUS_STARTED_AT="$started_at" STATUS_FINISHED_AT="$finished_at" \
-    STATUS_ARTIFACT_ERROR="$artifact_error" python3 -c 'import json, os; print(json.dumps({{"host": os.environ["STATUS_HOST"], "state": os.environ["STATUS_STATE"], "exit_code": int(os.environ["STATUS_EXIT_CODE"]), "command_exit_code": int(os.environ["STATUS_COMMAND_EXIT_CODE"]), "started_at": os.environ["STATUS_STARTED_AT"], "finished_at": os.environ["STATUS_FINISHED_AT"], "artifact_upload_error": os.environ["STATUS_ARTIFACT_ERROR"]}}, separators=(",", ":")))' \
+    STATUS_ARTIFACT_ERROR="$artifact_error" STATUS_INFRASTRUCTURE_FAILURE="$infrastructure_failure" \
+    python3 -c 'import json, os; print(json.dumps({{"host": os.environ["STATUS_HOST"], "state": os.environ["STATUS_STATE"], "exit_code": int(os.environ["STATUS_EXIT_CODE"]), "command_exit_code": int(os.environ["STATUS_COMMAND_EXIT_CODE"]), "started_at": os.environ["STATUS_STARTED_AT"], "finished_at": os.environ["STATUS_FINISHED_AT"], "artifact_upload_error": os.environ["STATUS_ARTIFACT_ERROR"], "infrastructure_failure": os.environ["STATUS_INFRASTRUCTURE_FAILURE"]}}, separators=(",", ":")))' \
     >"$ATTEMPT_DIR/status-$HOST.json"
   status_upload_attempt=0
   until "$GCLOUD_BIN" storage cp "$ATTEMPT_DIR/status-$HOST.json" "$ATTEMPT_GCS_DIR/status/$HOST.json"; do

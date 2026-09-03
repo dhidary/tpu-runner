@@ -282,7 +282,12 @@ checkpoint format, creation, and restore.
 Exit code 75 is reserved for retryable infrastructure failure. It is accepted
 as distributed infrastructure loss only when sibling exit codes are within the
 small allowed fallout set. Application failures must not be broadly reclassified
-as retryable.
+as retryable. A partial ordinary failure waits for a short bounded sibling-status
+grace before terminal classification so a later worker can report the decisive
+cause. The exact libtpu `SLICE_FAILURE_CHIP_DRIVER_ERROR` fatal is recorded in
+the worker status, treated as retryable infrastructure, and immediately recycles
+only its exact declared runner-managed Spot slice. An unmarked abort remains an
+application failure.
 
 ## Resource safety boundaries
 
