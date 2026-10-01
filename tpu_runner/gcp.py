@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import json
+import ssl
 import subprocess
 import urllib.error
 import urllib.parse
@@ -353,7 +354,7 @@ def describe_api_inventory_targets(
                 f"Cloud TPU API GET failed for exact {kind} {zone}/{name}: "
                 f"HTTP {exc.code}: {detail}"
             ) from exc
-        except (TimeoutError, urllib.error.URLError) as exc:
+        except (TimeoutError, urllib.error.URLError, ssl.SSLError) as exc:
             raise GCPInventoryError(
                 f"Cloud TPU API GET failed for exact {kind} {zone}/{name}: {exc}"
             ) from exc
