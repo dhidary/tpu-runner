@@ -289,6 +289,11 @@ the worker status, treated as retryable infrastructure, and immediately recycles
 only its exact declared runner-managed Spot slice. An unmarked abort remains an
 application failure.
 
+A partial launch failure keeps its launching attempt and resource ownership until
+exact-attempt cancellation and all-worker process checks confirm cleanup. Its
+persisted `failed_setup:` error prevents relaunch across controller restarts.
+Unreachable workers or ownership mismatches must not release the resource as idle.
+
 ## Resource safety boundaries
 
 - Inventory describes only exact declared/generated names plus exact known

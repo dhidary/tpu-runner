@@ -1354,10 +1354,15 @@ class Controller:
                 attempt.id != job.current_attempt_id
                 or attempt.job_id != job.spec.id
                 or attempt.resource_id != resource.id
+                or resource.current_job_id != job.spec.id
+                or resource.current_attempt_id != attempt.id
             ):
                 continue
             try:
                 if attempt.status == "launching":
+                    if attempt.error_summary.startswith("failed_setup:"):
+                        self.reconcile_failed_launch(runner, attempt, resource)
+                        continue
                     existing_result = runner.poll(job=job.spec, attempt=attempt, resource=resource)
                     if not existing_result.complete:
                         try:
@@ -1381,11 +1386,10 @@ class Controller:
                                     recycle_immediately=True,
                                 )
                             else:
-                                self.mark_attempt_command_failed(
-                                    attempt.id,
-                                    exit_code=2,
-                                    error_summary=f"failed_setup: {error_summary}",
-                                )
+                                # Persist before cleanup so a restart cannot relaunch peers.
+                                attempt.error_summary = f"failed_setup: {error_summary}"
+                                self.store.upsert_attempt(attempt)
+                                self.reconcile_failed_launch(runner, attempt, resource)
                             continue
                     attempt.status = "running"
                     if not attempt.started_at:
@@ -1496,7 +1500,29 @@ class Controller:
                 if self.store.list_interruption_requests_with_statuses({"requested"}):
                     return
             except Exception as exc:
-                self.mark_attempt_command_failed(attempt.id, exit_code=1, error_summary=str(exc))
+                # An observation/cleanup error is not proof that remote work stopped.
+                self.store.record_event(
+                    "controller_attempt_error",
+                    {"job_id": job.spec.id, "attempt_id": attempt.id, "error": str(exc)},
+                )
+
+    def reconcile_failed_launch(self, runner, attempt, resource) -> None:
+        """Keep ownership until all workers confirm the failed attempt has stopped."""
+        try:
+            outcome = runner.cancel(attempt=attempt, resource=resource)
+            if outcome == "attempt_mismatch" or not runner.attempt_stopped(
+                attempt=attempt, resource=resource
+            ):
+                return
+        except Exception as exc:
+            self.store.record_event(
+                "failed_launch_cleanup_pending",
+                {"attempt_id": attempt.id, "resource_id": resource.id, "error": str(exc)},
+            )
+            return
+        self.mark_attempt_command_failed(
+            attempt.id, exit_code=2, error_summary=attempt.error_summary
+        )
 
     def mark_attempt_command_failed(self, attempt_id: str, *, exit_code: int, error_summary: str = "") -> None:
         attempt = self.store.finish_attempt(

@@ -262,6 +262,30 @@ class DistributedTPURunner:
                 raise TemporaryAccessError(output.strip())
             raise RuntimeError(output.strip() or f"distributed launch failed with exit {result.returncode}")
 
+    def attempt_stopped(self, *, attempt: AttemptRecord, resource: ResourceRecord) -> bool:
+        """Require every worker to report no live process tagged with this attempt."""
+        probe = '''import os, pathlib, socket, sys
+tag = ("ATTEMPT_ID=" + sys.argv[1]).encode()
+for proc in pathlib.Path("/proc").glob("[0-9]*"):
+    try:
+        if proc.stat().st_uid != os.getuid():
+            continue
+        if tag in (proc / "environ").read_bytes().split(b"\\0"):
+            print("TPU_RUNNER_ATTEMPT_BUSY", socket.gethostname())
+            sys.exit(0)
+    except (FileNotFoundError, ProcessLookupError):
+        continue
+print("TPU_RUNNER_ATTEMPT_STOPPED", socket.gethostname())
+'''
+        result = self.run_tpu_vm_ssh_all(
+            resource=resource,
+            script="python3 -c " + shlex.quote(probe) + " " + shlex.quote(attempt.id),
+        )
+        if result.returncode:
+            raise RuntimeError("failed to verify all-worker attempt cleanup")
+        stopped = set(re.findall(r"^TPU_RUNNER_ATTEMPT_STOPPED (\S+)$", result.stdout, re.MULTILINE))
+        return len(stopped) == max(1, resource.worker_count)
+
     def cancel(self, *, attempt: AttemptRecord, resource: ResourceRecord) -> str:
         result = self.run_tpu_vm_ssh_all(
             resource=resource,
