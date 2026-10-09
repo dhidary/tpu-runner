@@ -271,9 +271,11 @@ class FirestoreStateStore:
         Firestore retries this transaction if assignment commits after its
         read.  The retry then observes the assignment and returns ``conflict``
         without writing, so guarded cancellation cannot deactivate a job that
-        has begun assignment.
+        has begun assignment. A retained attempt is allowed only after its
+        terminal record and absence of resource ownership are read here.
         """
         from google.cloud import firestore
+        from google.cloud.firestore_v1.base_query import FieldFilter
 
         ref = self._collection("jobs").document(job_id)
 
@@ -286,9 +288,43 @@ class FirestoreStateStore:
             if if_pending and (
                 job.status != "pending"
                 or job.assigned_resource_id is not None
-                or job.current_attempt_id is not None
             ):
                 return "conflict"
+            if if_pending and job.current_attempt_id is not None:
+                attempt_ref = self._collection("attempts").document(job.current_attempt_id)
+                attempt_snapshot = attempt_ref.get(transaction=transaction)
+                if not attempt_snapshot.exists:
+                    return "conflict"
+                attempt = attempt_record_from_dict(attempt_snapshot.to_dict())
+                if (
+                    attempt.id != job.current_attempt_id
+                    or attempt.job_id != job.spec.id
+                    or not attempt.ended_at
+                    or attempt.end_reason not in ATTEMPT_END_REASON_BY_STATUS.get(
+                        attempt.status, frozenset()
+                    )
+                ):
+                    return "conflict"
+                resource_ref = self._collection("resources").document(attempt.resource_id)
+                resource_snapshot = resource_ref.get(transaction=transaction)
+                if resource_snapshot.exists:
+                    resource = ResourceRecord(**resource_snapshot.to_dict())
+                    if (
+                        resource.id != attempt.resource_id
+                        or bool(resource.current_job_id) != bool(resource.current_attempt_id)
+                        or resource.current_job_id == job.spec.id
+                        or resource.current_attempt_id == attempt.id
+                    ):
+                        return "conflict"
+                for field, value in (
+                    ("current_job_id", job.spec.id),
+                    ("current_attempt_id", attempt.id),
+                ):
+                    owners = self._collection("resources").where(
+                        filter=FieldFilter(field, "==", value)
+                    ).limit(1)
+                    if next(iter(transaction.get(owners)), None) is not None:
+                        return "conflict"
             if job.status == "pending":
                 job.status = "deactivated"
             elif job.status == "running":
