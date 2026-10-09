@@ -257,7 +257,16 @@ The startup script runs as root and:
 - Creates runner-owned work, cache, process, and shared-memory roots.
 - Writes a readiness marker tied to the current boot ID.
 
-The controller SSHes to all workers. Each launch:
+The controller SSHes to all workers.
+
+When both runner SSH user and private key are configured, startup has already
+installed that key. SSH uses `--plain` with an explicit identity to avoid a
+redundant TPU metadata update, retaining IAP when configured. Credentials use
+private temporary files; host keys persist in an owner-validated private
+directory for the controller process lifetime. Changed recorded host keys are
+rejected. Unconfigured SSH retains gcloud's normal key management.
+
+Each launch:
 
 1. Verifies the current-boot readiness marker and an absolute executable
    `gcloud` path.
@@ -293,6 +302,8 @@ A partial launch failure keeps its launching attempt and resource ownership unti
 exact-attempt cancellation and all-worker process checks confirm cleanup. Its
 persisted `failed_setup:` error prevents relaunch across controller restarts.
 Unreachable workers or ownership mismatches must not release the resource as idle.
+Stopped-process verification requires passwordless sudo to inspect the original
+SSH user's process environments. Permission errors fail closed, not as stopped.
 
 ## Resource safety boundaries
 
