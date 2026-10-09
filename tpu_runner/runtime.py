@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from dataclasses import asdict, dataclass, replace
@@ -265,7 +266,28 @@ class FirestoreStateStore:
         snapshot = self._collection("jobs").document(job_id).get()
         return job_record_from_dict(snapshot.to_dict()) if snapshot.exists else None
 
-    def cancel_job(self, job_id: str, *, if_pending: bool = False) -> str | None:
+    def cancel_job_if_pending(
+        self, job_id: str, *, expected_job_sha256: str, expected_attempt_id: str
+    ) -> str | None:
+        """Deactivate only the exact observed, pending, released job version."""
+        if (
+            not isinstance(expected_job_sha256, str)
+            or len(expected_job_sha256) != 64
+            or any(c not in "0123456789abcdef" for c in expected_job_sha256)
+            or not isinstance(expected_attempt_id, str)
+            or not expected_attempt_id
+        ):
+            raise ValueError("Expected a job-document SHA256 and retained attempt ID")
+        return self.cancel_job(
+            job_id, if_pending=True, expected_job_sha256=expected_job_sha256,
+            expected_attempt_id=expected_attempt_id,
+        )
+
+    def cancel_job(
+        self, job_id: str, *, if_pending: bool = False,
+        expected_job_sha256: str | None = None,
+        expected_attempt_id: str | None = None,
+    ) -> str | None:
         """Cancel a job, optionally only while it is pending and unassigned.
 
         Firestore retries this transaction if assignment commits after its
@@ -273,7 +295,12 @@ class FirestoreStateStore:
         without writing, so guarded cancellation cannot deactivate a job that
         has begun assignment. A retained attempt is allowed only after its
         terminal record and absence of resource ownership are read here.
+        Optional observed-version pins are checked again on every retry.
         """
+        if (expected_job_sha256 is not None or expected_attempt_id is not None) and (
+            not if_pending or expected_job_sha256 is None or expected_attempt_id is None
+        ):
+            raise ValueError("Observed-version pins require pending-only cancellation")
         from google.cloud import firestore
         from google.cloud.firestore_v1.base_query import FieldFilter
 
@@ -285,6 +312,13 @@ class FirestoreStateStore:
             if not snapshot.exists:
                 return None
             job = job_record_from_dict(snapshot.to_dict())
+            if expected_job_sha256 is not None and (
+                job.current_attempt_id != expected_attempt_id
+                or hashlib.sha256(json.dumps(
+                    job_record_to_dict(job), sort_keys=True, allow_nan=False
+                ).encode()).hexdigest() != expected_job_sha256
+            ):
+                return "conflict"
             if if_pending and (
                 job.status != "pending"
                 or job.assigned_resource_id is not None
