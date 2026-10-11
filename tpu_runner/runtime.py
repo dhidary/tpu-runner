@@ -725,7 +725,15 @@ class FirestoreStateStore:
             attempt.error_summary = error_summary
             attempt.ended_at = datetime.now(timezone.utc).isoformat()
             attempt.end_reason = end_reason
-            job.status = job_status
+            # Apply the immutable job policy inside the ownership transaction,
+            # for preemption, infrastructure loss, and controlled interruption.
+            job.status = (
+                "failed"
+                if job_status == "pending"
+                and attempt_status == "interrupted"
+                and not job.spec.retry_on_infrastructure_failure
+                else job_status
+            )
             job.assigned_resource_id = None
             if retryable_infrastructure_failure:
                 if resource.retryable_infrastructure_job_id == attempt.job_id:
@@ -985,6 +993,9 @@ def parse_datetime(value: str) -> datetime | None:
 
 def job_record_to_dict(job: JobRecord) -> dict:
     spec = asdict(job.spec)
+    if job.spec.retry_on_infrastructure_failure:
+        # Keep default submissions identical, including with older controllers.
+        spec.pop("retry_on_infrastructure_failure")
     if isinstance(job.spec.tpu, tuple):
         spec["tpu"] = list(job.spec.tpu)
     spec["caches"] = [asdict(cache) for cache in job.spec.caches]
@@ -1050,6 +1061,7 @@ def job_record_from_dict(data: dict) -> JobRecord:
             storage_region=storage_region,
             bucket=bucket,
             priority=spec.get("priority", "normal"),
+            retry_on_infrastructure_failure=spec.get("retry_on_infrastructure_failure", True),
             caches=caches,
             env={str(key): str(value) for key, value in spec.get("env", {}).items()},
         ),

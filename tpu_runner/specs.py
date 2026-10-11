@@ -32,6 +32,7 @@ JOB_SPEC_FIELDS = frozenset(
         "caches",
         "env",
         "priority",
+        "retry_on_infrastructure_failure",
     }
 )
 STORED_JOB_SPEC_FIELDS = JOB_SPEC_FIELDS | {
@@ -152,8 +153,11 @@ class JobSpec:
     caches: tuple[CacheSpec, ...] = field(default_factory=tuple)
     env: dict[str, str] = field(default_factory=dict)
     priority: str = "normal"
+    retry_on_infrastructure_failure: bool = True
 
     def __post_init__(self) -> None:
+        if type(self.retry_on_infrastructure_failure) is not bool:
+            raise ValueError("job retry_on_infrastructure_failure must be a boolean")
         if not isinstance(self.priority, str):
             raise ValueError("job priority must be a string")
         priority = self.priority.strip().lower()
@@ -505,6 +509,7 @@ def job_specs_from_dict(data: dict[str, Any]) -> tuple[JobSpec, ...]:
                 zone=raw_zone.strip(),
                 buckets=buckets,
                 priority=raw.get("priority", "normal"),
+                retry_on_infrastructure_failure=raw.get("retry_on_infrastructure_failure", True),
                 caches=caches,
                 env={str(key): str(value) for key, value in raw_env.items()},
             )

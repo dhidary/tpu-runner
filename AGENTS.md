@@ -212,6 +212,20 @@ boundary; it selects the local bucket, and losing capacity disappears from
 desired demand on the next cycle and drains when idle. Retries remain pinned to
 the first winning region and bucket.
 
+Jobs default to `retry_on_infrastructure_failure: true`. A new job may set
+`retry_on_infrastructure_failure: false` when its command cannot safely restart.
+The completion transaction then makes the job terminal `failed` instead of
+`pending` after preemption/node loss, retryable infrastructure failure, or an
+explicit controlled interruption. The attempt remains `interrupted` with its
+actual `preempted`/`lost` reason. Cancellation still takes precedence. Resource
+cleanup, draining, and required recycling are unchanged; this is a job retry
+policy, not a TPU retention policy. Application failures already do not retry.
+It does not stop initial capacity racing or transport retries within an attempt,
+inspect application leases, restore checkpoints, or create continuation jobs.
+Omitted fields on existing records retain the default; no migration is needed.
+Deploy a supporting controller before submitting opt-out jobs: older controllers
+reject unknown spec fields. Client installation alone does not enable the policy.
+
 Generated queued-resource and TPU names are stable deployment ordinals. Never
 substitute undeclared ordinals just to satisfy a count; exact TPU pins depend on
 these names remaining stable.
