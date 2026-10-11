@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -10,6 +11,7 @@ import signal
 import stat
 import subprocess
 import tempfile
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -44,6 +46,9 @@ ARTIFACT_UPLOAD_ATTEMPTS = 3
 ARTIFACT_UPLOAD_RETRY_SECONDS = 5
 
 
+_SSH_HOSTS_LOCK = threading.Lock()
+
+
 @lru_cache(maxsize=1)
 def _ssh_state_directory():
     # Retain host keys across calls, but never share predictable /tmp files.
@@ -62,19 +67,91 @@ def _check_private_path(path: Path, *, directory: bool = False) -> None:
         raise ValueError("unsafe runner SSH credential or host-key path")
 
 
+def _authenticated_host_keys(project, resource):
+    parts = (project, resource.zone, resource.tpu_name)
+    if any(not isinstance(part, str) or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", part) for part in parts):
+        raise ValueError("invalid exact TPU host-key resource path")
+    if type(resource.worker_count) is not int or resource.worker_count < 1:
+        raise ValueError("invalid TPU worker count")
+    import google.auth
+    from google.auth.transport.requests import AuthorizedSession
+
+    credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    name = f"projects/{project}/locations/{resource.zone}/nodes/{resource.tpu_name}"
+    url = f"https://tpu.googleapis.com/v2alpha1/{name}"
+    with AuthorizedSession(credentials) as session:
+        def read_node():
+            response = session.get(url, timeout=20)
+            response.raise_for_status()
+            node = response.json()
+            if node.get("name") != name or not isinstance(node.get("id"), str) or not re.fullmatch(r"[1-9][0-9]*", node["id"]):
+                raise ValueError("missing or inconsistent TPU incarnation identity")
+            timestamp = node.get("createTime")
+            if not isinstance(timestamp, str):
+                raise ValueError("missing TPU incarnation timestamp")
+            created = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if created.tzinfo is None:
+                raise ValueError("missing timezone in TPU incarnation identity")
+            return node
+
+        before = read_node()
+        response = session.post(url + ":getGuestAttributes", json={}, timeout=20)
+        response.raise_for_status()
+        workers = response.json().get("guestAttributes", [])
+        after = read_node()
+    fields = ("id", "createTime", "networkEndpoints")
+    if any(before.get(key) != after.get(key) for key in fields):
+        raise ValueError("TPU incarnation changed during host-key lookup")
+    endpoints = after.get("networkEndpoints", [])
+    if not endpoints or len(endpoints) != resource.worker_count or len(workers) != len(endpoints):
+        raise ValueError("incomplete TPU worker host-key coverage")
+    lines = []
+    seen_addresses = set()
+    # gcloud uses response order to pair worker guest attributes with endpoints.
+    for index, worker in enumerate(workers):
+        items = worker.get("queryValue", {}).get("items", [])
+        names = [item.get("value", "") for item in items if item.get("namespace") == "deviceInfo" and item.get("key") == "hostname"]
+        keys = [item.get("value", "") for item in items if item.get("namespace") == "hostkeys" and item.get("key") == "ssh-ed25519"]
+        match = re.fullmatch(r"[a-z0-9][a-z0-9-]*-w-(\d+)", names[0]) if len(names) == 1 else None
+        if not match or len(keys) != 1:
+            raise ValueError("missing or ambiguous authenticated worker host key")
+        if int(match[1]) != index:
+            raise ValueError("invalid authenticated worker index")
+        raw = base64.b64decode(keys[0], validate=True)
+        if len(raw) != 51 or raw[:19] != b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20":
+            raise ValueError("malformed authenticated ED25519 host key")
+        endpoint = endpoints[index]
+        addresses = [endpoint.get("ipAddress", "")]
+        external = endpoint.get("accessConfig", {}).get("externalIp")
+        if external:
+            addresses.append(external)
+        for address in addresses:
+            canonical_address = ipaddress.ip_address(address)
+            if canonical_address in seen_addresses:
+                raise ValueError("duplicate authenticated worker IP address")
+            seen_addresses.add(canonical_address)
+            lines.append(f"{address} ssh-ed25519 {keys[0]}\n")
+    identity = json.dumps([project, resource.zone, resource.tpu_name, after["id"], after["createTime"]]).encode()
+    return identity, "".join(sorted(lines))
+
+
 @contextmanager
 def _preinstalled_ssh_flags(project, resource, user, private_key):
-    root = Path(_ssh_state_directory().name)
-    _check_private_path(root, directory=True)
-    identity = json.dumps([project, resource.zone, resource.tpu_name]).encode()
-    hosts = root / (hashlib.sha256(identity).hexdigest() + ".known_hosts")
-    try:
-        fd = os.open(hosts, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    except FileExistsError:
-        pass
-    else:
-        os.close(fd)
-    _check_private_path(hosts)
+    identity, trusted_keys = _authenticated_host_keys(project, resource)
+    with _SSH_HOSTS_LOCK:
+        root = Path(_ssh_state_directory().name)
+        _check_private_path(root, directory=True)
+        hosts = root / (hashlib.sha256(identity).hexdigest() + ".known_hosts")
+        try:
+            fd = os.open(hosts, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(fd, "w") as handle:
+                handle.write(trusted_keys)
+        _check_private_path(hosts)
+        if hosts.read_text() != trusted_keys:
+            raise ValueError("host keys changed within the same TPU incarnation")
     with tempfile.TemporaryDirectory(prefix="key-", dir=root) as directory:
         key = Path(directory) / "identity"
         _check_private_path(Path(directory), directory=True)
@@ -96,7 +173,12 @@ def _preinstalled_ssh_flags(project, resource, user, private_key):
             "--ssh-flag=-o IdentitiesOnly=yes",
             "--ssh-flag=-o BatchMode=yes",
             "--ssh-flag=-o ConnectTimeout=15",
-            "--ssh-flag=-o StrictHostKeyChecking=accept-new",
+            "--ssh-flag=-o StrictHostKeyChecking=yes",
+            "--ssh-flag=-o GlobalKnownHostsFile=/dev/null",
+            "--ssh-flag=-o HostKeyAlgorithms=ssh-ed25519",
+            "--ssh-flag=-o UpdateHostKeys=no",
+            "--ssh-flag=-o HostKeyAlias=%INSTANCE%",
+            "--ssh-flag=-o CheckHostIP=no",
             f"--ssh-flag=-o UserKnownHostsFile={shlex.quote(str(hosts))}",
         ]
 _LAUNCH_ACK_RE = re.compile(

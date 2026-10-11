@@ -238,7 +238,10 @@ def _main(argv: list[str] | None = None) -> int:
             "Validate the selected jobs, archive and upload their local bundles and "
             "regional specifications, atomically create the queue records, and "
             "trigger the controller. JSON events include each generated job ID and "
-            "artifact location. Capacity racing never creates duplicate executions."
+            "artifact location. Capacity racing never creates duplicate executions. "
+            "Jobs retry infrastructure interruptions by default; set the job YAML "
+            "field retry_on_infrastructure_failure: false to fail instead. "
+            "This requires a controller version supporting that field."
         ),
         example="tpu-runner submit job.yaml --job-id train-1",
     )

@@ -420,7 +420,11 @@ class Controller:
                     )
                 if finished_attempt is not None:
                     self.store.record_event(
-                        "controlled_interruption_attempt_requeued",
+                        (
+                            "controlled_interruption_attempt_requeued"
+                            if job.spec.retry_on_infrastructure_failure
+                            else "controlled_interruption_attempt_retry_suppressed"
+                        ),
                         interruption_event_payload(request, queued_resource.name),
                     )
                 self.store.record_event(

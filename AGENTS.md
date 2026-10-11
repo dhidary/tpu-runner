@@ -212,6 +212,20 @@ boundary; it selects the local bucket, and losing capacity disappears from
 desired demand on the next cycle and drains when idle. Retries remain pinned to
 the first winning region and bucket.
 
+Jobs default to `retry_on_infrastructure_failure: true`. A new job may set
+`retry_on_infrastructure_failure: false` when its command cannot safely restart.
+The completion transaction then makes the job terminal `failed` instead of
+`pending` after preemption/node loss, retryable infrastructure failure, or an
+explicit controlled interruption. The attempt remains `interrupted` with its
+actual `preempted`/`lost` reason. Cancellation still takes precedence. Resource
+cleanup, draining, and required recycling are unchanged; this is a job retry
+policy, not a TPU retention policy. Application failures already do not retry.
+It does not stop initial capacity racing or transport retries within an attempt,
+inspect application leases, restore checkpoints, or create continuation jobs.
+Omitted fields on existing records retain the default; no migration is needed.
+Deploy a supporting controller before submitting opt-out jobs: older controllers
+reject unknown spec fields. Client installation alone does not enable the policy.
+
 Generated queued-resource and TPU names are stable deployment ordinals. Never
 substitute undeclared ordinals just to satisfy a count; exact TPU pins depend on
 these names remaining stable.
@@ -259,12 +273,17 @@ The startup script runs as root and:
 
 The controller SSHes to all workers.
 
-When both runner SSH user and private key are configured, startup has already
-installed that key. SSH uses `--plain` with an explicit identity to avoid a
-redundant TPU metadata update, retaining IAP when configured. Credentials use
-private temporary files; host keys persist in an owner-validated private
-directory for the controller process lifetime. Changed recorded host keys are
-rejected. Unconfigured SSH retains gcloud's normal key management.
+When a runner SSH user/private key pair is configured, use the preinstalled key
+with `--plain` to avoid redundant metadata updates, retaining IAP when configured.
+Credentials use private temporary files. Trust is populated from authenticated
+GCP guest attributes for every worker, bracketed by exact node reads. The private
+trust-file identity includes node ID and creation timestamp, so recreated managed
+ordinals do not reuse a previous incarnation's keys. Missing or inconsistent
+identity, worker keys, or endpoints fail closed. Changed keys within one observed
+incarnation are rejected. Strict checking remains enabled for both IAP and direct
+SSH. Unconfigured SSH retains gcloud's normal key management. This does not reset
+failed attempts or grant cleanup sudo privileges; root-visible stopped-process
+inspection must still succeed before releasing ownership.
 
 Each launch:
 
@@ -302,8 +321,6 @@ A partial launch failure keeps its launching attempt and resource ownership unti
 exact-attempt cancellation and all-worker process checks confirm cleanup. Its
 persisted `failed_setup:` error prevents relaunch across controller restarts.
 Unreachable workers or ownership mismatches must not release the resource as idle.
-Stopped-process verification requires passwordless sudo to inspect the original
-SSH user's process environments. Permission errors fail closed, not as stopped.
 
 ## Resource safety boundaries
 
