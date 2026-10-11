@@ -271,7 +271,21 @@ The startup script runs as root and:
 - Creates runner-owned work, cache, process, and shared-memory roots.
 - Writes a readiness marker tied to the current boot ID.
 
-The controller SSHes to all workers. Each launch:
+The controller SSHes to all workers.
+
+When a runner SSH user/private key pair is configured, use the preinstalled key
+with `--plain` to avoid redundant metadata updates, retaining IAP when configured.
+Credentials use private temporary files. Trust is populated from authenticated
+GCP guest attributes for every worker, bracketed by exact node reads. The private
+trust-file identity includes node ID and creation timestamp, so recreated managed
+ordinals do not reuse a previous incarnation's keys. Missing or inconsistent
+identity, worker keys, or endpoints fail closed. Changed keys within one observed
+incarnation are rejected. Strict checking remains enabled for both IAP and direct
+SSH. Unconfigured SSH retains gcloud's normal key management. This does not reset
+failed attempts or grant cleanup sudo privileges; root-visible stopped-process
+inspection must still succeed before releasing ownership.
+
+Each launch:
 
 1. Verifies the current-boot readiness marker and an absolute executable
    `gcloud` path.

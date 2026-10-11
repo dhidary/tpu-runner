@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import ipaddress
 import json
 import os
 import re
 import shlex
 import signal
+import stat
 import subprocess
+import tempfile
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from functools import lru_cache
 
 from .runtime import AttemptRecord, ResourceRecord, checkpoint_dir, job_bucket, parse_datetime
 from .specs import CacheSpec, JobSpec
@@ -37,6 +44,143 @@ STARTUP_READY_TIMEOUT_SECONDS = 120
 DEVICE_RELEASE_TIMEOUT_SECONDS = 60
 ARTIFACT_UPLOAD_ATTEMPTS = 3
 ARTIFACT_UPLOAD_RETRY_SECONDS = 5
+
+
+_SSH_HOSTS_LOCK = threading.Lock()
+
+
+@lru_cache(maxsize=1)
+def _ssh_state_directory():
+    # Retain host keys across calls, but never share predictable /tmp files.
+    return tempfile.TemporaryDirectory(prefix="tpu-runner-ssh-")
+
+
+def _check_private_path(path: Path, *, directory: bool = False) -> None:
+    info = path.lstat()
+    expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+    if (
+        not expected_type(info.st_mode)
+        or info.st_uid != os.getuid()
+        or stat.S_IMODE(info.st_mode) != (0o700 if directory else 0o600)
+        or (not directory and info.st_nlink != 1)
+    ):
+        raise ValueError("unsafe runner SSH credential or host-key path")
+
+
+def _authenticated_host_keys(project, resource):
+    parts = (project, resource.zone, resource.tpu_name)
+    if any(not isinstance(part, str) or not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", part) for part in parts):
+        raise ValueError("invalid exact TPU host-key resource path")
+    if type(resource.worker_count) is not int or resource.worker_count < 1:
+        raise ValueError("invalid TPU worker count")
+    import google.auth
+    from google.auth.transport.requests import AuthorizedSession
+
+    credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    name = f"projects/{project}/locations/{resource.zone}/nodes/{resource.tpu_name}"
+    url = f"https://tpu.googleapis.com/v2alpha1/{name}"
+    with AuthorizedSession(credentials) as session:
+        def read_node():
+            response = session.get(url, timeout=20)
+            response.raise_for_status()
+            node = response.json()
+            if node.get("name") != name or not isinstance(node.get("id"), str) or not re.fullmatch(r"[1-9][0-9]*", node["id"]):
+                raise ValueError("missing or inconsistent TPU incarnation identity")
+            timestamp = node.get("createTime")
+            if not isinstance(timestamp, str):
+                raise ValueError("missing TPU incarnation timestamp")
+            created = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if created.tzinfo is None:
+                raise ValueError("missing timezone in TPU incarnation identity")
+            return node
+
+        before = read_node()
+        response = session.post(url + ":getGuestAttributes", json={}, timeout=20)
+        response.raise_for_status()
+        workers = response.json().get("guestAttributes", [])
+        after = read_node()
+    fields = ("id", "createTime", "networkEndpoints")
+    if any(before.get(key) != after.get(key) for key in fields):
+        raise ValueError("TPU incarnation changed during host-key lookup")
+    endpoints = after.get("networkEndpoints", [])
+    if not endpoints or len(endpoints) != resource.worker_count or len(workers) != len(endpoints):
+        raise ValueError("incomplete TPU worker host-key coverage")
+    lines = []
+    seen_addresses = set()
+    # gcloud uses response order to pair worker guest attributes with endpoints.
+    for index, worker in enumerate(workers):
+        items = worker.get("queryValue", {}).get("items", [])
+        names = [item.get("value", "") for item in items if item.get("namespace") == "deviceInfo" and item.get("key") == "hostname"]
+        keys = [item.get("value", "") for item in items if item.get("namespace") == "hostkeys" and item.get("key") == "ssh-ed25519"]
+        match = re.fullmatch(r"[a-z0-9][a-z0-9-]*-w-(\d+)", names[0]) if len(names) == 1 else None
+        if not match or len(keys) != 1:
+            raise ValueError("missing or ambiguous authenticated worker host key")
+        if int(match[1]) != index:
+            raise ValueError("invalid authenticated worker index")
+        raw = base64.b64decode(keys[0], validate=True)
+        if len(raw) != 51 or raw[:19] != b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20":
+            raise ValueError("malformed authenticated ED25519 host key")
+        endpoint = endpoints[index]
+        addresses = [endpoint.get("ipAddress", "")]
+        external = endpoint.get("accessConfig", {}).get("externalIp")
+        if external:
+            addresses.append(external)
+        for address in addresses:
+            canonical_address = ipaddress.ip_address(address)
+            if canonical_address in seen_addresses:
+                raise ValueError("duplicate authenticated worker IP address")
+            seen_addresses.add(canonical_address)
+            lines.append(f"{address} ssh-ed25519 {keys[0]}\n")
+    identity = json.dumps([project, resource.zone, resource.tpu_name, after["id"], after["createTime"]]).encode()
+    return identity, "".join(sorted(lines))
+
+
+@contextmanager
+def _preinstalled_ssh_flags(project, resource, user, private_key):
+    identity, trusted_keys = _authenticated_host_keys(project, resource)
+    with _SSH_HOSTS_LOCK:
+        root = Path(_ssh_state_directory().name)
+        _check_private_path(root, directory=True)
+        hosts = root / (hashlib.sha256(identity).hexdigest() + ".known_hosts")
+        try:
+            fd = os.open(hosts, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(fd, "w") as handle:
+                handle.write(trusted_keys)
+        _check_private_path(hosts)
+        if hosts.read_text() != trusted_keys:
+            raise ValueError("host keys changed within the same TPU incarnation")
+    with tempfile.TemporaryDirectory(prefix="key-", dir=root) as directory:
+        key = Path(directory) / "identity"
+        _check_private_path(Path(directory), directory=True)
+        for path, content in (
+            (key, private_key),
+            (key.with_suffix(".pub"), None),
+        ):
+            if content is None:
+                public = subprocess.check_output(["ssh-keygen", "-y", "-f", str(key)], text=True)
+                content = f"{public.strip()} {user}\n"
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "w") as handle:
+                handle.write(content)
+            _check_private_path(path)
+        yield [
+            f"--ssh-key-file={key}",
+            "--plain",
+            f"--ssh-flag=-i {shlex.quote(str(key))}",
+            "--ssh-flag=-o IdentitiesOnly=yes",
+            "--ssh-flag=-o BatchMode=yes",
+            "--ssh-flag=-o ConnectTimeout=15",
+            "--ssh-flag=-o StrictHostKeyChecking=yes",
+            "--ssh-flag=-o GlobalKnownHostsFile=/dev/null",
+            "--ssh-flag=-o HostKeyAlgorithms=ssh-ed25519",
+            "--ssh-flag=-o UpdateHostKeys=no",
+            "--ssh-flag=-o HostKeyAlias=%INSTANCE%",
+            "--ssh-flag=-o CheckHostIP=no",
+            f"--ssh-flag=-o UserKnownHostsFile={shlex.quote(str(hosts))}",
+        ]
 _LAUNCH_ACK_RE = re.compile(
     r"^TPU_RUNNER_(?:LAUNCHED|ALREADY_RUNNING|ALREADY_COMPLETE)\s+(\S+)(?:\s+.*)?$",
     re.MULTILINE,
@@ -265,10 +409,13 @@ class DistributedTPURunner:
     def attempt_stopped(self, *, attempt: AttemptRecord, resource: ResourceRecord) -> bool:
         """Require every worker to report no live process tagged with this attempt."""
         probe = '''import os, pathlib, socket, sys
+if os.geteuid() != 0:
+    raise PermissionError("root-visible process inspection required")
+owner_uid = int(sys.argv[2])
 tag = ("ATTEMPT_ID=" + sys.argv[1]).encode()
 for proc in pathlib.Path("/proc").glob("[0-9]*"):
     try:
-        if proc.stat().st_uid != os.getuid():
+        if proc.stat().st_uid != owner_uid:
             continue
         if tag in (proc / "environ").read_bytes().split(b"\\0"):
             print("TPU_RUNNER_ATTEMPT_BUSY", socket.gethostname())
@@ -279,7 +426,7 @@ print("TPU_RUNNER_ATTEMPT_STOPPED", socket.gethostname())
 '''
         result = self.run_tpu_vm_ssh_all(
             resource=resource,
-            script="python3 -c " + shlex.quote(probe) + " " + shlex.quote(attempt.id),
+            script="sudo -n python3 -c " + shlex.quote(probe) + " " + shlex.quote(attempt.id) + ' "$(id -u)"',
         )
         if result.returncode:
             raise RuntimeError("failed to verify all-worker attempt cleanup")
@@ -976,14 +1123,12 @@ fi
         ssh_private_key = os.environ.get("TPU_RUNNER_SSH_PRIVATE_KEY", "")
         if bool(ssh_user) != bool(ssh_private_key):
             raise ValueError("TPU_RUNNER_SSH_USER and TPU_RUNNER_SSH_PRIVATE_KEY must be set together")
-        target = resource.tpu_name
         if ssh_user:
-            target = f"{ssh_user}@{target}"
-            key_path = Path("/tmp/tpu-runner-ssh-key")
-            key_path.write_text(ssh_private_key)
-            key_path.chmod(0o600)
-            public_key = subprocess.check_output(["ssh-keygen", "-y", "-f", str(key_path)], text=True)
-            key_path.with_suffix(".pub").write_text(f"{public_key.strip()} {ssh_user}\n")
+            with _preinstalled_ssh_flags(self.project, resource, ssh_user, ssh_private_key) as flags:
+                return self._run_tpu_vm_ssh_all(resource, script, f"{ssh_user}@{resource.tpu_name}", flags)
+        return self._run_tpu_vm_ssh_all(resource, script, resource.tpu_name, [])
+
+    def _run_tpu_vm_ssh_all(self, resource, script, target, ssh_flags):
         command = [
             "gcloud",
             "alpha",
@@ -1001,8 +1146,7 @@ fi
             command.insert(-2, "--tunnel-through-iap")
         elif self.ssh_transport != "direct":
             raise ValueError(f"unsupported SSH transport: {self.ssh_transport!r}")
-        if ssh_user:
-            command.insert(-1, f"--ssh-key-file={key_path}")
+        command[-1:-1] = ssh_flags
         if self.project:
             command.insert(7, f"--project={self.project}")
         process = subprocess.Popen(
