@@ -282,8 +282,8 @@ ordinals do not reuse a previous incarnation's keys. Missing or inconsistent
 identity, worker keys, or endpoints fail closed. Changed keys within one observed
 incarnation are rejected. Strict checking remains enabled for both IAP and direct
 SSH. Unconfigured SSH retains gcloud's normal key management. This does not reset
-failed attempts or grant cleanup sudo privileges; root-visible stopped-process
-inspection must still succeed before releasing ownership.
+failed attempts; root-visible stopped-process inspection must still succeed
+before releasing ownership.
 
 Each launch:
 
@@ -321,6 +321,14 @@ A partial launch failure keeps its launching attempt and resource ownership unti
 exact-attempt cancellation and all-worker process checks confirm cleanup. Its
 persisted `failed_setup:` error prevents relaunch across controller restarts.
 Unreachable workers or ownership mismatches must not release the resource as idle.
+
+Stopped-process verification uses the root-owned, isolated-Python checker
+`/usr/local/libexec/tpu-runner-attempt-stopped`. Startup grants `tpurunner` sudo
+access only to that read-only command, not Python or a shell. The checker derives
+the process owner from sudo's caller UID and accepts only one attempt ID.
+Permission errors fail closed, not as stopped. Startup verifies this permission
+before publishing `cleanup_probe=ready`; new launches require that marker.
+Existing workers need updated startup before this controller is deployed.
 
 ## Resource safety boundaries
 

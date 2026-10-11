@@ -408,25 +408,9 @@ class DistributedTPURunner:
 
     def attempt_stopped(self, *, attempt: AttemptRecord, resource: ResourceRecord) -> bool:
         """Require every worker to report no live process tagged with this attempt."""
-        probe = '''import os, pathlib, socket, sys
-if os.geteuid() != 0:
-    raise PermissionError("root-visible process inspection required")
-owner_uid = int(sys.argv[2])
-tag = ("ATTEMPT_ID=" + sys.argv[1]).encode()
-for proc in pathlib.Path("/proc").glob("[0-9]*"):
-    try:
-        if proc.stat().st_uid != owner_uid:
-            continue
-        if tag in (proc / "environ").read_bytes().split(b"\\0"):
-            print("TPU_RUNNER_ATTEMPT_BUSY", socket.gethostname())
-            sys.exit(0)
-    except (FileNotFoundError, ProcessLookupError):
-        continue
-print("TPU_RUNNER_ATTEMPT_STOPPED", socket.gethostname())
-'''
         result = self.run_tpu_vm_ssh_all(
             resource=resource,
-            script="sudo -n python3 -c " + shlex.quote(probe) + " " + shlex.quote(attempt.id) + ' "$(id -u)"',
+            script="sudo -n -- /usr/local/libexec/tpu-runner-attempt-stopped " + shlex.quote(attempt.id),
         )
         if result.returncode:
             raise RuntimeError("failed to verify all-worker attempt cleanup")
@@ -742,7 +726,8 @@ current_boot_id="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
 startup_ready_deadline=$((SECONDS + STARTUP_READY_TIMEOUT_SECONDS))
 while [[ -z "$current_boot_id" ]] || \
       [[ ! -r "$STARTUP_READY_MARKER" ]] || \
-      ! grep -Fxq "boot_id=$current_boot_id" "$STARTUP_READY_MARKER"; do
+      ! grep -Fxq "boot_id=$current_boot_id" "$STARTUP_READY_MARKER" || \
+      ! grep -Fxq "cleanup_probe=ready" "$STARTUP_READY_MARKER"; do
   if (( SECONDS >= startup_ready_deadline )); then
     echo "[runner] startup readiness timed out after ${{STARTUP_READY_TIMEOUT_SECONDS}}s: $STARTUP_READY_MARKER" >&2
     exit 2

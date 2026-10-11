@@ -135,8 +135,10 @@ while IFS= read -r secret; do
 done <<< "$WORKER_SECRETS"
 
 SSH_PUBLIC_KEY="$(ssh-keygen -y -f "$SSH_KEY_FILE") tpurunner"
+WORKER_PROBE_B64="$("$PYTHON" -c 'import base64, pathlib, sys; print(base64.b64encode(pathlib.Path(sys.argv[1]).read_bytes()).decode())' "$SCRIPT_DIR/worker_probe.py")"
 sed \
   -e "s|__TPU_RUNNER_SSH_PUBLIC_KEY__|${SSH_PUBLIC_KEY}|" \
+  -e "s|__TPU_RUNNER_WORKER_PROBE_B64__|${WORKER_PROBE_B64}|" \
   -e "s|/tmp/tpu-runner|/tmp/${NAME}|g" \
   -e "s|/dev/shm/tpu-runner|/dev/shm/${NAME}|g" \
   -e "s|/var/lib/tpu-runner|/var/lib/${NAME}|g" \
