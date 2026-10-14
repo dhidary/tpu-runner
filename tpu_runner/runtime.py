@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import subprocess
+import base64
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -951,21 +951,41 @@ class FirestoreStateStore:
 
 
 class GCSArtifactClient:
+    def __init__(self, project: str | None = None) -> None:
+        from google.cloud import storage
+
+        self.client = storage.Client(project=project)
+
     def upload(self, source: Path, uri: str) -> None:
-        command = ["gcloud", "storage", "cp", str(source), uri]
-        result = subprocess.run(
-            command,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
-        if result.returncode != 0:
-            raise subprocess.CalledProcessError(
-                result.returncode,
-                command,
-                output=result.stdout,
-                stderr=result.stderr,
+        import google_crc32c
+        from google.api_core.exceptions import NotFound, PreconditionFailed
+        from google.cloud.storage import Blob
+        from google.cloud.storage.retry import DEFAULT_RETRY_IF_GENERATION_SPECIFIED
+
+        blob = Blob.from_string(uri, client=self.client)
+        checksum = google_crc32c.Checksum()
+        with source.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                checksum.update(chunk)
+        expected = base64.b64encode(checksum.digest()).decode("ascii")
+        try:
+            blob.reload(timeout=60)
+        except NotFound:
+            try:
+                blob.upload_from_filename(
+                    str(source),
+                    if_generation_match=0,
+                    checksum="crc32c",
+                    timeout=60,
+                    retry=DEFAULT_RETRY_IF_GENERATION_SPECIFIED,
+                )
+            except PreconditionFailed:
+                # Another publisher (or a successful upload with a lost response)
+                # won. Never overwrite it; verify the committed object instead.
+                blob.reload(timeout=60)
+        if blob.size != source.stat().st_size or blob.crc32c != expected:
+            raise RuntimeError(
+                f"artifact integrity mismatch at {uri}; existing object not overwritten"
             )
 
 

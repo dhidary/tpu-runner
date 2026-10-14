@@ -13,6 +13,7 @@ requires-python = ">=3.11"
 dependencies = [
     "google-auth>=2.40",
     "google-cloud-firestore>=2.16",
+    "google-cloud-storage>=3.0,<4",
     "PyYAML>=6.0",
 ]
 keywords = ["gcp", "google-cloud", "tpu", "orchestration"]

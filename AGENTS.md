@@ -104,6 +104,15 @@ Artifacts may exist without a Firestore job if preparation or atomic creation
 fails. That is harmless. A Firestore job must never be visible before its
 bundle and materialized spec exist.
 
+Submission artifact uploads and remote YAML downloads use the Cloud Storage SDK
+with refreshable ADC, not the separate gcloud login. Uploads are create-only
+(`if_generation_match=0`); existing objects and concurrent winners must match
+the local size and CRC32C. Authentication or integrity failures must stop before
+queue publication. Never retry the entire submission after an ambiguous commit
+without reconciling the exact job IDs. For unattended submissions, supply an
+attached workload service account or workload federation; local user ADC can
+still require reauthentication. Do not embed tokens or service-account keys.
+
 ## Controller reconciliation order
 
 `Controller.reconcile_once` deliberately runs in this order:

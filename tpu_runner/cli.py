@@ -135,9 +135,12 @@ class ControllerLeaseRenewer:
 def main(argv: list[str] | None = None) -> int:
     """Run the public CLI with concise errors for expected user failures."""
 
+    from google.api_core.exceptions import GoogleAPIError
+    from google.auth.exceptions import GoogleAuthError
+
     try:
         return _main(argv)
-    except (FileNotFoundError, RuntimeError, ValueError) as exc:
+    except (FileNotFoundError, RuntimeError, ValueError, GoogleAPIError, GoogleAuthError) as exc:
         print(f"tpu-runner: error: {exc}", file=sys.stderr)
         return 2
 
@@ -686,8 +689,12 @@ def require_controller_ssh_identity(env: Mapping[str, str]) -> None:
 def materialize_path(path: str) -> Path:
     if not path.startswith("gs://"):
         return Path(path)
+    from google.cloud import storage
+
     tmp = Path(tempfile.mkdtemp(prefix="tpu-runner-spec-")) / Path(path).name
-    subprocess.run(["gcloud", "storage", "cp", path, str(tmp)], check=True)
+    storage.Blob.from_string(path, client=storage.Client()).download_to_filename(
+        str(tmp), checksum="crc32c", timeout=60
+    )
     return tmp
 
 
@@ -1098,7 +1105,7 @@ def submit_jobs(path: Path, *, job_ids: Sequence[str] | None = None) -> int:
             )
         )
 
-    artifacts = GCSArtifactClient()
+    artifacts = GCSArtifactClient(project=project)
     prepared: list[tuple[JobRecord, tuple[str, ...]]] = []
     submission_token = uuid.uuid4().hex
     for raw_spec in regional_specs:
@@ -1229,31 +1236,10 @@ def publish_regional_bundles(
         raise ValueError(f"bundle must be a directory, tar archive, or GCS URI: {source}")
     try:
         regional_bundles: list[tuple[str, str]] = []
+        artifacts = GCSArtifactClient(project=project)
         for region, bucket in bucket_regions:
             uri = f"{bucket}/bundles/{digest}.tar.gz"
-            command = [
-                "gcloud",
-                "storage",
-                "cp",
-                "--no-clobber",
-                str(archive),
-                uri,
-                f"--project={project}",
-            ]
-            result = subprocess.run(
-                command,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
-            if result.returncode != 0:
-                raise subprocess.CalledProcessError(
-                    result.returncode,
-                    command,
-                    output=result.stdout,
-                    stderr=result.stderr,
-                )
+            artifacts.upload(archive, uri)
             regional_bundles.append((region, uri))
         return tuple(regional_bundles)
     finally:
