@@ -1221,6 +1221,8 @@ def publish_regional_bundles(
     bucket_regions: tuple[tuple[str, str], ...],
     project: str,
 ) -> tuple[tuple[str, str], ...]:
+    from .runtime import GCSArtifactClient
+
     if bundle.startswith("gs://"):
         if len(bucket_regions) != 1:
             raise ValueError("multi-region jobs require a local source bundle")
